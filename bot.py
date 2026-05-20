@@ -2,30 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Smart Medical Assistant Bot - Gemini Paid Economical Edition
+Smart Medical Assistant Bot - OpenRouter Economical Edition
 
-Core idea:
-- Gemini only, no Groq.
-- 30MB max upload.
-- Persistent SQLite cache by file hash.
-- Same file from any user = reuse summaries/questions, no new Gemini call.
-- 3 quiz levels only:
-    1. basic      -> up to 50 direct/simple MCQs per file
-    2. cases      -> up to 5 clinical case MCQs per file
-    3. challenge  -> up to 2 hard/challenging MCQs per file
-- User can request 5 / 10 / 20 / 30 / 40 Basic questions from the already-generated pool.
-- AI receives max 40,000 characters from each extracted lecture for better coverage while still using the cheapest Gemini model.
-- Cases and Challenge ignore large counts and use their strict limits.
-- Detective mode removed completely.
-
-Required env:
-    TELEGRAM_BOT_TOKEN
-    GOOGLE_API_KEY
-
-Optional env:
-    GEMINI_MODEL=gemini-1.5-flash-8b
-    MAX_CONCURRENT_GEMINI=2
-    DATABASE_PATH=bot_cache.sqlite3
+Changes:
+- Replaced Google Gemini API with OpenRouter API (supports gemini-2.5-flash-lite)
+- Uses urllib.request instead of google.generativeai
+- All other features (cache, quiz levels, summaries, etc.) unchanged
+- Fixed HTTP-Referer header (hyphen instead of underscore)
 """
 
 import asyncio
@@ -39,10 +22,12 @@ import re
 import sqlite3
 import time
 import uuid
+import base64
+import urllib.request
+import urllib.error
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import google.generativeai as genai
 from docx import Document
 from pypdf import PdfReader
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -69,8 +54,8 @@ logger = logging.getLogger("gemini_medical_bot")
 # ENVIRONMENT
 # =============================================================================
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
-GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash-8b")
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "google/gemini-2.5-flash-lite")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_cache.sqlite3")
 MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
 MAX_TEXT_CHARS_FOR_AI = 40000
@@ -79,8 +64,6 @@ COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 
 ADMIN_USER_IDS = {1692255414}
 
-genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 _GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
 
 # =============================================================================
@@ -411,41 +394,83 @@ def update_stats(user_data: dict, score: int, total: int) -> None:
 
 
 # =============================================================================
-# GEMINI
+# OPENROUTER (replaces Gemini) - FIXED HEADER
 # =============================================================================
 async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: int = 4096) -> str:
+    """Send request to OpenRouter API (compatible with Gemini models)."""
     async with _GEMINI_SEMAPHORE:
         def work():
-            response = gemini_model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
-                ),
+            payload = {
+                "model": GEMINI_MODEL_NAME,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": temperature,
+                "max_tokens": max_output_tokens,
+            }
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://telegram.org",   # <--- FIXED: hyphen instead of underscore
+                    "X-Title": "Medical Telegram Bot",
+                },
+                method="POST",
             )
-            return (response.text or "").strip()
+            with urllib.request.urlopen(req, timeout=120) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                return data["choices"][0]["message"]["content"].strip()
         return await asyncio.to_thread(work)
 
 
 async def extract_text_from_image(image_bytes: bytes, mime_type: str) -> str:
+    """Extract text from image using OpenRouter vision capabilities."""
     async with _GEMINI_SEMAPHORE:
         def work():
-            response = gemini_model.generate_content(
-                [
-                    "Extract all readable text from this medical image exactly. Do not summarize. Return only raw text.",
-                    {"mime_type": mime_type or "image/jpeg", "data": image_bytes},
+            b64 = base64.b64encode(image_bytes).decode("utf-8")
+            image_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
+
+            payload = {
+                "model": GEMINI_MODEL_NAME,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Extract all readable text from this medical image exactly. Do not summarize. Return only raw text."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_url}
+                            }
+                        ]
+                    }
                 ],
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.0,
-                    max_output_tokens=4096,
-                ),
+                "temperature": 0.0,
+                "max_tokens": 4096,
+            }
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://telegram.org",   # <--- FIXED: hyphen instead of underscore
+                    "X-Title": "Medical Telegram Bot",
+                },
+                method="POST",
             )
-            return (response.text or "").strip()
+            with urllib.request.urlopen(req, timeout=120) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                return data["choices"][0]["message"]["content"].strip()
         return await asyncio.to_thread(work)
 
 
 # =============================================================================
-# TEXT EXTRACTION
+# TEXT EXTRACTION (unchanged)
 # =============================================================================
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -485,7 +510,7 @@ async def extract_text(file_type: str, raw_bytes: bytes, mime_type: str) -> str:
 
 
 # =============================================================================
-# PROMPTS
+# PROMPTS (unchanged)
 # =============================================================================
 LEVEL_LIMITS = {
     "basic": 50,
@@ -573,10 +598,10 @@ English only.
 
 
 # =============================================================================
-# QUESTION GENERATION + VALIDATION
+# QUESTION GENERATION + VALIDATION (unchanged)
 # =============================================================================
 def extract_json_array(raw: str) -> Optional[list]:
-    """Extract a JSON array safely from Gemini output."""
+    """Extract a JSON array safely from AI output."""
     raw = (raw or "").strip()
 
     # Try direct parse
@@ -664,7 +689,7 @@ SOURCE TEXT:
     raw = await call_gemini(prompt, temperature=0.15, max_output_tokens=8192)
     parsed = extract_json_array(raw)
     if parsed is None:
-        logger.warning("Gemini returned invalid JSON for %s: %s", level, raw[:500])
+        logger.warning("AI returned invalid JSON for %s: %s", level, raw[:500])
         return []
     questions = normalize_questions(parsed)
     return questions[:limit]
@@ -698,7 +723,7 @@ SOURCE TEXT:
 
 
 # =============================================================================
-# KEYBOARDS
+# KEYBOARDS (unchanged)
 # =============================================================================
 def lang_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -768,7 +793,7 @@ def review_keyboard(current: int, total: int) -> InlineKeyboardMarkup:
 
 
 # =============================================================================
-# FORMATTING
+# FORMATTING (unchanged)
 # =============================================================================
 def format_question(q: dict, idx: int, total: int, user_data: dict) -> str:
     opts = q.get("options", {})
@@ -804,7 +829,7 @@ def format_review(entry: dict, idx: int, total: int, user_data: dict) -> str:
 
 
 # =============================================================================
-# SENDERS
+# SENDERS (unchanged)
 # =============================================================================
 async def safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
     for attempt in range(2):
@@ -858,7 +883,7 @@ async def send_final_score(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # =============================================================================
-# COMMANDS
+# COMMANDS (unchanged)
 # =============================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
@@ -910,13 +935,13 @@ async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         reply = await call_gemini("Reply with exactly: OK", temperature=0.0, max_output_tokens=10)
-        await update.message.reply_text(f"✅ Gemini response: {reply[:50]}")
+        await update.message.reply_text(f"✅ OpenRouter response: {reply[:50]}")
     except Exception as e:
-        await update.message.reply_text(f"❌ Gemini failed: {e}")
+        await update.message.reply_text(f"❌ OpenRouter failed: {e}")
 
 
 # =============================================================================
-# CALLBACKS
+# CALLBACKS (unchanged)
 # =============================================================================
 async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1149,7 +1174,7 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# FILE HANDLING
+# FILE HANDLING (unchanged)
 # =============================================================================
 def classify_document(mime: str, name: str) -> Optional[str]:
     mime = (mime or "").lower()
