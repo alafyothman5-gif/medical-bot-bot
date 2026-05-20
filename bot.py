@@ -1,628 +1,452 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Smart Medical Assistant Bot
-- Primary AI: Groq (llama-3.3-70b-versatile) – fast, high limits, free
-- Fallback AI: Google Gemini 1.5 Flash – free, reliable backup
-- Queue-based request management, LRU cache, Pickle persistence
-- Strict prompts, low temperature, JSON validation for accuracy
+Smart Medical Assistant Bot - Gemini Paid Economical Edition
+
+Core idea:
+- Gemini only, no Groq.
+- 30MB max upload.
+- Persistent SQLite cache by file hash.
+- Same file from any user = reuse summaries/questions, no new Gemini call.
+- 3 quiz levels only:
+    1. basic      -> up to 50 direct/simple MCQs per file
+    2. cases      -> up to 5 clinical case MCQs per file
+    3. challenge  -> up to 2 hard/challenging MCQs per file
+- User can request 5 / 10 / 20 / 30 / 40 Basic questions from the already-generated pool.
+- AI receives max 40,000 characters from each extracted lecture for better coverage while still using the cheapest Gemini model.
+- Cases and Challenge ignore large counts and use their strict limits.
+- Detective mode removed completely.
+
+Required env:
+    TELEGRAM_BOT_TOKEN
+    GOOGLE_API_KEY
+
+Optional env:
+    GEMINI_MODEL=gemini-1.5-flash-8b
+    MAX_CONCURRENT_GEMINI=2
+    DATABASE_PATH=bot_cache.sqlite3
 """
 
 import asyncio
-import base64
-import copy
 import hashlib
 import io
 import json
 import logging
 import os
-import pickle
 import random
 import re
-import threading
+import sqlite3
 import time
 import uuid
-from collections import OrderedDict, defaultdict
 from datetime import datetime
-from typing import Any, DefaultDict, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-# AI libraries
 import google.generativeai as genai
-from groq import Groq
-
-# Telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.error import BadRequest as _TelegramBadRequest
+from docx import Document
+from pypdf import PdfReader
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
-    PicklePersistence,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
-    filters,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
+    PicklePersistence,
+    filters,
 )
 
-# Document processing
-from pypdf import PdfReader
-from docx import Document
-
-# ----------------------------------------------------------------------
+# =============================================================================
 # LOGGING
-# ----------------------------------------------------------------------
+# =============================================================================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("gemini_medical_bot")
 
-# ----------------------------------------------------------------------
-# ENVIRONMENT VARIABLES
-# ----------------------------------------------------------------------
+# =============================================================================
+# ENVIRONMENT
+# =============================================================================
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-
-# Groq (primary)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_AVAILABLE = bool(GROQ_API_KEY)
-if GROQ_AVAILABLE:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    logger.info("Groq client initialized (primary AI)")
-
-# Google Gemini (fallback)
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash-8b")
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_cache.sqlite3")
+MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
+MAX_TEXT_CHARS_FOR_AI = 40000
+MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "2"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
+
+ADMIN_USER_IDS = {1692255414}
+
 genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-logger.info("Gemini client initialized (fallback AI)")
+gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+_GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
 
-# ----------------------------------------------------------------------
-# PERFORMANCE & CONCURRENCY
-# ----------------------------------------------------------------------
-_MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_WORKERS", "10"))
-_API_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT)
-_REQUEST_QUEUE = asyncio.Queue(maxsize=500)
-_QUEUE_WORKERS = []
-
-# Result cache (LRU)
-_RESULT_CACHE_SIZE = int(os.environ.get("RESULT_CACHE_SIZE", "512"))
-_RESULT_CACHE: OrderedDict = OrderedDict()
-_RESULT_CACHE_LOCK = threading.Lock()
-
-def _cache_get(key: tuple) -> Any:
-    with _RESULT_CACHE_LOCK:
-        val = _RESULT_CACHE.get(key)
-        if val is None:
-            return None
-        _RESULT_CACHE.move_to_end(key)
-    return copy.deepcopy(val)
-
-def _cache_put(key: tuple, value: Any) -> None:
-    snapshot = copy.deepcopy(value)
-    with _RESULT_CACHE_LOCK:
-        if key in _RESULT_CACHE:
-            _RESULT_CACHE.move_to_end(key)
-            _RESULT_CACHE[key] = snapshot
-            return
-        _RESULT_CACHE[key] = snapshot
-        while len(_RESULT_CACHE) > _RESULT_CACHE_SIZE:
-            _RESULT_CACHE.popitem(last=False)
-
-def _md5_bytes(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()
-
-# ----------------------------------------------------------------------
-# ADMIN GATE
-# ----------------------------------------------------------------------
-ADMIN_USER_IDS: list[int] = [1692255414]   # Replace with your Telegram ID
-
-def _is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
-
-logger.info(f"Admin gate: {len(ADMIN_USER_IDS)} admin(s)")
-
-# ----------------------------------------------------------------------
-# SAMPLE MEDICAL TEXT (for self-test)
-# ----------------------------------------------------------------------
-SAMPLE_MEDICAL_TEXT = (
-    "The heart is a four-chambered muscular organ that pumps blood through the circulatory "
-    "system. The right atrium receives deoxygenated blood from the body via the superior and "
-    "inferior vena cava, passes it to the right ventricle, which pumps it through the pulmonary "
-    "artery to the lungs. Oxygenated blood returns through the pulmonary veins to the left atrium, "
-    "flows into the left ventricle, and is ejected via the aorta to the systemic circulation.\n\n"
-    "The sinoatrial (SA) node, located in the right atrium, is the primary pacemaker of the heart "
-    "and normally fires at 60–100 beats per minute in resting adults. The atrioventricular (AV) "
-    "node delays conduction to allow ventricular filling. Coronary arteries supply the myocardium "
-    "with blood; rupture of an atherosclerotic plaque with subsequent thrombus formation is the "
-    "most common cause of acute myocardial infarction.\n\n"
-    "Common ECG findings in acute STEMI include ST-segment elevation in two or more contiguous "
-    "leads. First-line acute management includes aspirin, oxygen if hypoxic, nitrates for pain, "
-    "and reperfusion via primary PCI within 90 minutes when available."
-)
-
-# ----------------------------------------------------------------------
-# INTERNATIONALISATION (UI translations) - simplified for brevity
-# ----------------------------------------------------------------------
+# =============================================================================
+# TRANSLATIONS
+# =============================================================================
 SUPPORTED_LANGS = ("en", "ar")
+
 TRANSLATIONS = {
     "en": {
-        "choose_lang": "🌐 <b>Choose your language</b>\n<i>اختر لغتك المفضلة</i>",
-        "lang_set": "✅ Language set to English.",
-        "btn_lang_en": "🇬🇧  English",
-        "btn_lang_ar": "🇸🇦  العربية",
-        "welcome": "Welcome to your Smart Medical Assistant! 🩺⚡️\n\nUpload any medical file and I'll generate MCQs, summaries, or detective cases.\n\nUse the menu below 👇",
-        "help": "Send a medical file. Use /stats, /review, /stop, /language.",
-        "diff_easy": "🟢 Easy", "diff_medium": "🟡 Medium", "diff_hard": "🔴 Hard", "diff_nightmare": "💀 Nightmare",
-        "diff_easy_label": "Easy", "diff_medium_label": "Medium", "diff_hard_label": "Hard", "diff_nightmare_label": "Nightmare",
-        "pdf_received": "📄 File received — extracting text…",
-        "pdf_ready": "✅ File ready — choose difficulty:",
-        "pdf_no_text": "⚠️ Could not extract text.",
-        "pdf_failed": "❌ Failed: {err}",
-        "stale_button": "⚠️ This button is outdated.",
-        "diff_selected": "✅ *{diff}* — how many questions?",
-        "generating": "⏳ *Generating {count} questions* (difficulty: {diff})",
-        "ready": "✅ *Quiz ready!* {count} questions. Good luck!",
-        "no_questions": "❌ Couldn't generate questions.",
-        "json_error": "❌ JSON parse error.",
-        "mcq_error": "❌ Error: {err}",
-        "meta_question": "Question {i} / {n}",
-        "correct": "✅ *Correct*",
-        "wrong": "❌ *Wrong* — you chose *{chosen}*",
-        "answer_label": "*Answer:*",
-        "explanation": "📖 *Explanation:*",
-        "send_failed_alive": "⚠️ Network issue, quiz still active.",
-        "answer_error_recovery": "⚠️ Error, quiz resumed.",
-        "plain_final": "Quiz Complete!\nScore: {score}/{total} ({pct}%)",
-        "complete_title": "🎓 *Quiz Complete*",
-        "lbl_difficulty": "*Difficulty:*",
-        "lbl_score": "*Score:*",
-        "lbl_grade": "*Grade:*",
-        "wrong_count": "❌ {n} wrong answer(s).",
-        "btn_review": "📋 Review Mistakes",
-        "btn_stats": "📊 My Stats",
-        "btn_new_quiz": "➕ New Quiz",
-        "grade_outstanding": "Outstanding", "grade_excellent": "Excellent", "grade_good": "Good",
-        "grade_satisfactory": "Satisfactory", "grade_review": "Needs review", "grade_study": "Significant study needed",
-        "btn_review_next": "Next ▶", "btn_review_exit": "✖ Done",
-        "review_header": "📋 *Review {i} / {n}*",
-        "review_your": "*Your answer:*",
-        "review_correct_short": "✅ correct",
-        "review_wrong_short": "❌ wrong",
-        "review_timeout_short": "⏰ no answer",
-        "review_complete": "✅ Review complete.",
-        "review_ended": "Review ended.",
-        "review_none": "✅ No wrong answers.",
-        "review_no_active": "No active review.",
-        "stats_header": "📊 *Your Statistics*",
-        "stats_quizzes": "🏁 *Quizzes:*",
-        "stats_correct": "✅ *Correct:*",
-        "stats_accuracy": "🎯 *Accuracy:*",
-        "stats_best": "🏆 *Best score:*",
-        "stats_fav": "❤️ *Favourite:*",
-        "stopped": "🛑 Quiz stopped.",
-        "no_active": "No active quiz.",
-        "quiz_in_progress": "A quiz is in progress. Use /stop to end.",
-        "send_pdf_hint": "Send me a medical file to start.",
-        "unhandled_error": "⚠️ Unexpected error.",
+        "choose_lang": "🌐 Choose your language\nاختر لغتك",
+        "welcome": "Welcome to your Smart Medical Assistant 🩺\n\nSend a medical PDF, image, DOCX, or TXT file.",
+        "help": "Send a medical file up to 30MB. Choose Quiz or Summary. Commands: /start /stop /stats /review /language",
         "choose_mode": "📂 Choose mode:",
-        "btn_mode_quiz": "📝 Quiz",
-        "btn_mode_summary": "📚 Summary",
-        "btn_mode_detective": "🕵️‍♂️ Detective",
-        "mode_quiz_prompt": "📝 *Quiz mode* — send your file.",
-        "mode_detective_prompt": "🕵️‍♂️ *Detective mode* — send a file or type a topic.",
-        "detective_opening": "🕵️‍♂️ *New case opened…*",
-        "detective_thinking": "🕵️‍♂️ *Analysing your move…*",
-        "detective_round_header": "🕵️‍♂️ *Round {round}/{max}*",
-        "detective_final_header": "🏁 *Final verdict*",
-        "detective_finished": "✅ Case closed.",
-        "detective_error": "❌ Error: {err}",
-        "detective_no_input": "⚠️ Send a file or topic.",
-        "detective_busy": "⏳ Still processing previous move.",
-        "mode_summary_prompt": "📚 *Summary mode* — send your file.",
-        "choose_summary_style": "📋 Choose summary style:",
-        "btn_style_disease": "🩺 Disease Profile",
-        "btn_style_highyield": "🧠 High-Yield",
-        "btn_style_osce": "📋 OSCE",
-        "btn_back": "⬅️ Back",
-        "style_selected_disease": "🩺 Disease Profile selected.",
-        "style_selected_highyield": "🧠 High-Yield selected.",
-        "style_selected_osce": "📋 OSCE selected.",
-        "summary_generating": "⏳ Generating summary...",
-        "summary_header": "📚 *Summary*\n\n",
-        "summary_failed": "❌ Failed: {err}",
-        "file_received": "📄 File received — extracting text…",
-        "file_no_text": "⚠️ No text found.",
-        "file_unsupported": "⚠️ Unsupported file type.",
-        "support_text": "شكراً لدعمك! 🌟\nيمكنك دعم البوت عبر:",
-        "support_madar": "📱 رصيد مدار",
-        "support_details": "للتحويل إلى الرقم: 0918874659\nثم أرسل الإيصال إلى @Othma2003\nشكراً! 💙",
+        "mode_quiz": "📝 Quiz",
+        "mode_summary": "📚 Summary",
+        "mode_quiz_prompt": "📝 Quiz mode selected. Send your file.",
+        "mode_summary_prompt": "📚 Summary mode selected. Choose style, then send your file.",
+        "summary_style_prompt": "📋 Choose summary style:",
+        "style_disease": "🩺 Disease Profile",
+        "style_highyield": "🧠 High-Yield",
+        "style_osce": "📋 OSCE",
+        "file_received": "📄 File received — extracting text...",
+        "file_too_large": "⚠️ File is larger than 30MB. Please send a smaller file.",
+        "file_unsupported": "⚠️ Unsupported file type. Send PDF, image, DOCX, or TXT.",
+        "file_no_text": "⚠️ I could not extract readable text from this file.",
+        "file_ready_quiz": "✅ File ready. Choose question level:",
+        "file_ready_summary": "✅ File ready. Preparing summary...",
+        "cached_file": "♻️ Same file found in cache. No extra AI cost.",
+        "level_basic": "🟢 Basic",
+        "level_cases": "🩺 Cases",
+        "level_challenge": "🧠 Challenge",
+        "basic_count_prompt": "How many Basic questions do you want?",
+        "generating_pool": "⏳ Preparing question bank. This happens once per file...",
+        "generating_summary": "⏳ Preparing summary. This happens once per file/style...",
+        "not_enough": "⚠️ This lecture only has {n} available questions for this level. Starting with available questions.",
+        "quiz_ready": "✅ Quiz ready: {n} questions.",
+        "no_questions": "❌ No questions could be generated from this file.",
+        "summary_header": "📚 Summary\n\n",
+        "stale": "⚠️ This button is outdated. Send /start or upload the file again.",
+        "cooldown": "⚠️ Please wait {wait} seconds before sending another request.",
+        "busy": "⚠️ You already have a request being processed. Please wait.",
+        "q_meta": "Question {i}/{n}",
+        "correct": "✅ Correct",
+        "wrong": "❌ Wrong — you chose {chosen}",
+        "answer": "Answer:",
+        "explanation": "Explanation:",
+        "complete": "🎓 Quiz Complete\n\nScore: {score}/{total} ({pct}%)",
+        "review": "📋 Review Mistakes",
+        "stats": "📊 My Stats",
+        "new_quiz": "➕ New Quiz",
+        "review_none": "✅ No wrong answers to review.",
+        "review_done": "✅ Review complete.",
+        "stopped": "🛑 Stopped.",
+        "no_active": "No active quiz.",
+        "quiz_in_progress": "A quiz is in progress. Use /stop to end it.",
+        "send_file_hint": "Send a medical file to start.",
+        "stats_text": "📊 Your Statistics\n\nQuizzes: {quizzes}\nCorrect: {correct}/{total}\nAccuracy: {accuracy}%\nBest score: {best}%",
+        "error": "⚠️ Error: {err}",
     },
     "ar": {
-        "choose_lang": "🌐 <b>اختر لغتك</b>",
-        "lang_set": "✅ تم تعيين العربية.",
-        "btn_lang_en": "English", "btn_lang_ar": "العربية",
-        "welcome": "مرحباً! 🩺 أرسل ملفاً طبياً.",
-        "help": "أرسل ملفاً طبياً. استخدم /stats, /review, /stop, /language.",
-        "diff_easy": "🟢 سهل", "diff_medium": "🟡 متوسط", "diff_hard": "🔴 صعب", "diff_nightmare": "💀 كابوس",
-        "diff_easy_label": "سهل", "diff_medium_label": "متوسط", "diff_hard_label": "صعب", "diff_nightmare_label": "كابوس",
-        "pdf_received": "📄 تم الاستلام...", "pdf_ready": "✅ الملف جاهز.", "pdf_no_text": "⚠️ لا نص.", "pdf_failed": "❌ فشل: {err}",
-        "stale_button": "⚠️ زر قديم.", "diff_selected": "✅ *{diff}* كم سؤالاً؟",
-        "generating": "⏳ *جاري إنشاء {count} سؤال* ({diff})",
-        "ready": "✅ *الاختبار جاهز!* {count} سؤال. بالتوفيق!",
-        "no_questions": "❌ لا أسئلة.", "json_error": "❌ خطأ في JSON.", "mcq_error": "❌ خطأ: {err}",
-        "meta_question": "سؤال {i} / {n}", "correct": "✅ *صحيح*", "wrong": "❌ *خطأ* اخترت *{chosen}*",
-        "answer_label": "*الإجابة:*", "explanation": "📖 *شرح:*",
-        "send_failed_alive": "⚠️ مشكلة شبكة.", "answer_error_recovery": "⚠️ خطأ، تم الاستئناف.",
-        "plain_final": "الاختبار انتهى!\nالنتيجة: {score}/{total} ({pct}%)",
-        "complete_title": "🎓 *انتهى الاختبار*", "lbl_difficulty": "*الصعوبة:*", "lbl_score": "*النتيجة:*", "lbl_grade": "*التقدير:*",
-        "wrong_count": "❌ {n} إجابة خاطئة.", "btn_review": "📋 مراجعة", "btn_stats": "📊 إحصائياتي", "btn_new_quiz": "➕ اختبار جديد",
-        "grade_outstanding": "ممتاز", "grade_excellent": "جيد جداً", "grade_good": "جيد", "grade_satisfactory": "مقبول", "grade_review": "يحتاج مراجعة", "grade_study": "يحتاج دراسة مكثفة",
-        "btn_review_next": "التالي ▶", "btn_review_exit": "✖ خروج", "review_header": "📋 *مراجعة {i} / {n}*",
-        "review_your": "*إجابتك:*", "review_correct_short": "✅ صحيحة", "review_wrong_short": "❌ خاطئة", "review_timeout_short": "⏰ بدون إجابة",
-        "review_complete": "✅ انتهت المراجعة.", "review_ended": "انتهت المراجعة.", "review_none": "✅ لا أخطاء.", "review_no_active": "لا مراجعة نشطة.",
-        "stats_header": "📊 *إحصائياتك*", "stats_quizzes": "🏁 *الاختبارات:*", "stats_correct": "✅ *الصحيحة:*",
-        "stats_accuracy": "🎯 *الدقة:*", "stats_best": "🏆 *أفضل نتيجة:*", "stats_fav": "❤️ *المفضلة:*",
-        "stopped": "🛑 توقف الاختبار.", "no_active": "لا اختبار نشط.", "quiz_in_progress": "يوجد اختبار نشط. استخدم /stop.",
-        "send_pdf_hint": "أرسل ملفاً طبياً.", "unhandled_error": "⚠️ خطأ غير متوقع.",
-        "choose_mode": "📂 اختر الوضع:", "btn_mode_quiz": "📝 اختبار", "btn_mode_summary": "📚 ملخص", "btn_mode_detective": "🕵️‍♂️ محقق",
-        "mode_quiz_prompt": "📝 *وضع الاختبار* — أرسل ملفك.", "mode_detective_prompt": "🕵️‍♂️ *وضع المحقق* — أرسل ملفاً أو اكتب موضوعاً.",
-        "detective_opening": "🕵️‍♂️ *حالة جديدة...*", "detective_thinking": "🕵️‍♂️ *تحليل...*",
-        "detective_round_header": "🕵️‍♂️ *جولة {round}/{max}*", "detective_final_header": "🏁 *الحكم النهائي*",
-        "detective_finished": "✅ انتهت القضية.", "detective_error": "❌ خطأ: {err}", "detective_no_input": "⚠️ أرسل ملفاً أو موضوعاً.", "detective_busy": "⏳ انتظر...",
-        "mode_summary_prompt": "📚 *وضع الملخص* — أرسل ملفك.", "choose_summary_style": "📋 اختر نمط الملخص:",
-        "btn_style_disease": "🩺 ملف المرض", "btn_style_highyield": "🧠 نقاط حيوية", "btn_style_osce": "📋 نهج OSCE", "btn_back": "⬅️ رجوع",
-        "style_selected_disease": "🩺 تم اختيار ملف المرض.", "style_selected_highyield": "🧠 تم اختيار النقاط الحيوية.", "style_selected_osce": "📋 تم اختيار نهج OSCE.",
-        "summary_generating": "⏳ جاري إنشاء الملخص...", "summary_header": "📚 *ملخص*\n\n", "summary_failed": "❌ فشل: {err}",
-        "file_received": "📄 تم استلام الملف...", "file_no_text": "⚠️ لا نص.", "file_unsupported": "⚠️ نوع ملف غير مدعوم.",
-        "support_text": "شكراً لدعمك! 🌟\nيمكنك دعم البوت عبر:", "support_madar": "📱 رصيد مدار",
-        "support_details": "للتحويل إلى الرقم: 0918874659\nثم أرسل الإيصال إلى @Othma2003\nشكراً! 💙",
+        "choose_lang": "🌐 اختر لغتك",
+        "welcome": "مرحباً بك في المساعد الطبي الذكي 🩺\n\nأرسل ملف PDF أو صورة أو DOCX أو TXT.",
+        "help": "أرسل ملفاً طبياً حتى 30MB. اختر اختبار أو ملخص. الأوامر: /start /stop /stats /review /language",
+        "choose_mode": "📂 اختر الوضع:",
+        "mode_quiz": "📝 اختبار",
+        "mode_summary": "📚 ملخص",
+        "mode_quiz_prompt": "📝 تم اختيار الاختبار. أرسل الملف.",
+        "mode_summary_prompt": "📚 تم اختيار الملخص. اختر نوع الملخص ثم أرسل الملف.",
+        "summary_style_prompt": "📋 اختر نوع الملخص:",
+        "style_disease": "🩺 ملف المرض",
+        "style_highyield": "🧠 نقاط مهمة",
+        "style_osce": "📋 OSCE",
+        "file_received": "📄 تم استلام الملف — جاري استخراج النص...",
+        "file_too_large": "⚠️ الملف أكبر من 30MB. أرسل ملفاً أصغر.",
+        "file_unsupported": "⚠️ نوع الملف غير مدعوم. أرسل PDF أو صورة أو DOCX أو TXT.",
+        "file_no_text": "⚠️ لم أستطع استخراج نص مقروء من الملف.",
+        "file_ready_quiz": "✅ الملف جاهز. اختر مستوى الأسئلة:",
+        "file_ready_summary": "✅ الملف جاهز. جاري تجهيز الملخص...",
+        "cached_file": "♻️ الملف موجود مسبقاً في الكاش. لن نستهلك Gemini من جديد.",
+        "level_basic": "🟢 Basic مباشر",
+        "level_cases": "🩺 Cases حالات",
+        "level_challenge": "🧠 Challenge تحدي",
+        "basic_count_prompt": "كم سؤال Basic تريد؟",
+        "generating_pool": "⏳ جاري تجهيز بنك الأسئلة. يحدث هذا مرة واحدة فقط لكل ملف...",
+        "generating_summary": "⏳ جاري تجهيز الملخص. يحدث هذا مرة واحدة فقط لكل ملف/نوع...",
+        "not_enough": "⚠️ هذه المحاضرة فيها {n} سؤال فقط لهذا المستوى. سأبدأ بالموجود.",
+        "quiz_ready": "✅ الاختبار جاهز: {n} سؤال.",
+        "no_questions": "❌ لم أستطع توليد أسئلة من هذا الملف.",
+        "summary_header": "📚 الملخص\n\n",
+        "stale": "⚠️ هذا الزر قديم. أرسل /start أو ارفع الملف من جديد.",
+        "cooldown": "⚠️ انتظر {wait} ثانية قبل إرسال طلب جديد.",
+        "busy": "⚠️ لديك طلب قيد المعالجة. الرجاء الانتظار.",
+        "q_meta": "السؤال {i}/{n}",
+        "correct": "✅ صحيح",
+        "wrong": "❌ خطأ — اخترت {chosen}",
+        "answer": "الإجابة:",
+        "explanation": "الشرح:",
+        "complete": "🎓 انتهى الاختبار\n\nالنتيجة: {score}/{total} ({pct}%)",
+        "review": "📋 مراجعة الأخطاء",
+        "stats": "📊 إحصائياتي",
+        "new_quiz": "➕ اختبار جديد",
+        "review_none": "✅ لا توجد أخطاء للمراجعة.",
+        "review_done": "✅ انتهت المراجعة.",
+        "stopped": "🛑 تم الإيقاف.",
+        "no_active": "لا يوجد اختبار نشط.",
+        "quiz_in_progress": "يوجد اختبار نشط. استخدم /stop لإنهائه.",
+        "send_file_hint": "أرسل ملفاً طبياً للبدء.",
+        "stats_text": "📊 إحصائياتك\n\nالاختبارات: {quizzes}\nالصحيح: {correct}/{total}\nالدقة: {accuracy}%\nأفضل نتيجة: {best}%",
+        "error": "⚠️ خطأ: {err}",
     },
 }
+
 
 def get_lang(user_data: dict) -> str:
-    lang = user_data.get("lang", "en")
-    return lang if lang in SUPPORTED_LANGS else "en"
+    lang = user_data.get("lang", "ar")
+    return lang if lang in SUPPORTED_LANGS else "ar"
 
-def t(key: str, lang: str = "en", **kwargs) -> str:
-    bundle = TRANSLATIONS.get(lang, TRANSLATIONS["en"])
-    text = bundle.get(key, TRANSLATIONS["en"].get(key, key))
-    if kwargs:
-        try:
-            return text.format(**kwargs)
-        except Exception:
-            return text
-    return text
 
-def diff_label(difficulty: str, lang: str) -> str:
-    return t(f"diff_{difficulty}_label", lang)
-
-# ----------------------------------------------------------------------
-# DIFFICULTY SYSTEM PROMPTS (strict, anti-hallucination)
-# ----------------------------------------------------------------------
-DIFFICULTY_CONFIGS = {
-    "easy": {
-        "system_prompt": (
-            "You are a medical educator writing introductory-level MCQs for first- and second-year medical students.\n"
-            "You MUST base every question ONLY on the provided source text. Do NOT use external knowledge.\n"
-            "If the source text lacks information for a proper question, respond with an empty JSON array.\n\n"
-            "VIGNETTE: brief clinical vignette with age, sex, chief complaint, and 1-2 key findings.\n"
-            "DISTRACTORS: 5 options, all belonging to same clinical category, no filler.\n"
-            "EXPLANATION: 2–3 sentences, state why correct answer is right and name the most tempting wrong answer.\n"
-            "All output MUST be English. Output valid JSON array only: [{\"question\":\"...\",\"options\":{\"A\":\"...\",...},\"correct\":\"A\",\"explanation\":\"...\"}]\n"
-        )
-    },
-    "medium": {
-        "system_prompt": (
-            "You are a medical professor writing USMLE Step 1-style MCQs.\n"
-            "Base questions ONLY on the provided text. Do NOT invent facts.\n\n"
-            "VIGNETTE: full clinical vignette with demographics, history, exam, and at least one lab/imaging.\n"
-            "Requires integration of 2-3 clues. Stem asks for most likely diagnosis, next step, mechanism, or initial investigation.\n"
-            "DISTRACTORS: 5 highly plausible options targeting common errors.\n"
-            "EXPLANATION: 3–4 sentences, include reasoning chain, mechanism, and why two tempting distractors are wrong.\n"
-            "Output English JSON only.\n"
-        )
-    },
-    "hard": {
-        "system_prompt": (
-            "You are a senior USMLE examiner writing Step 2/3 style MCQs.\n"
-            "Use ONLY the provided source text.\n\n"
-            "VIGNETTE: detailed, with vitals, positive/negative findings, multiple investigations, and deliberate complexity.\n"
-            "Stem targets higher-order reasoning (management of complications, atypical presentation, etc.).\n"
-            "DISTRACTORS: all 5 closely related, each defensible in a different scenario.\n"
-            "EXPLANATION: 4–5 sentences, include correct reasoning, mechanism, why two dangerous distractors are wrong, and a clinical pearl.\n"
-            "Output English JSON only.\n"
-        )
-    },
-    "nightmare": {
-        "system_prompt": (
-            "You are the most rigorous medical board examiner. Write elite trap questions for USMLE Step 3 / subspecialty.\n"
-            "Use ONLY the provided source text. Never hallucinate.\n\n"
-            "VIGNETTE: extremely detailed, with red herrings, subtle clues requiring synthesis.\n"
-            "DISTRACTORS: each appears correct at first glance, exploiting cognitive biases.\n"
-            "EXPLANATION: 5–6 sentences, unmask the red herring, state correct reasoning, explain mechanism, address the most dangerous distractor, and give a high-yield pearl.\n"
-            "Output English JSON only.\n"
-        )
-    },
-}
-
-# ----------------------------------------------------------------------
-# HELPER: AI CALL WITH FALLBACK (Groq primary, Gemini secondary)
-# ----------------------------------------------------------------------
-async def _call_ai_with_fallback(system_prompt: str, user_prompt: str, temperature: float = 0.2, max_tokens: int = 4096, retries: int = 2) -> str:
-    """Call Groq (llama-3.3-70b-versatile), fallback to Gemini on failure."""
-    last_exception = None
-    if GROQ_AVAILABLE:
-        for attempt in range(retries):
-            try:
-                response = await asyncio.to_thread(
-                    groq_client.chat.completions.create,
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                return response.choices[0].message.content.strip()
-            except Exception as e:
-                last_exception = e
-                logger.warning(f"Groq attempt {attempt+1} failed: {e}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(0.5 * (2 ** attempt))
-    # Fallback to Gemini
+def t(user_data: dict, key: str, **kwargs) -> str:
+    lang = get_lang(user_data)
+    text = TRANSLATIONS.get(lang, TRANSLATIONS["ar"]).get(key, key)
     try:
-        full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        response = await asyncio.to_thread(
-            gemini_model.generate_content,
-            full_prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens
+        return text.format(**kwargs)
+    except Exception:
+        return text
+
+
+# =============================================================================
+# SQLITE CACHE
+# =============================================================================
+_db_lock = asyncio.Lock()
+
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = _db_connect()
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS files (
+            file_hash TEXT PRIMARY KEY,
+            file_name TEXT,
+            file_size INTEGER,
+            mime_type TEXT,
+            extracted_text TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS question_banks (
+            file_hash TEXT NOT NULL,
+            level TEXT NOT NULL,
+            questions_json TEXT NOT NULL,
+            created_at TEXT,
+            PRIMARY KEY (file_hash, level)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS summaries (
+            file_hash TEXT NOT NULL,
+            style TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            created_at TEXT,
+            PRIMARY KEY (file_hash, style)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+async def db_get_file(file_hash: str) -> Optional[dict]:
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            row = conn.execute("SELECT * FROM files WHERE file_hash=?", (file_hash,)).fetchone()
+            conn.close()
+            return dict(row) if row else None
+        return await asyncio.to_thread(work)
+
+
+async def db_save_file(file_hash: str, file_name: str, file_size: int, mime_type: str, extracted_text: str) -> None:
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO files(file_hash, file_name, file_size, mime_type, extracted_text, created_at)
+                VALUES(?,?,?,?,?,?)
+                """,
+                (file_hash, file_name, file_size, mime_type, extracted_text, datetime.utcnow().isoformat()),
             )
-        )
-        return response.text.strip()
-    except Exception as e:
-        last_exception = e
-        logger.error(f"Gemini fallback also failed: {e}")
-    raise Exception(f"All AI providers failed: {last_exception}")
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(work)
 
-# ----------------------------------------------------------------------
-# MCQ GENERATION (with chunking, parallel via queue, strict JSON validation)
-# ----------------------------------------------------------------------
-_MCQ_BATCH_SIZE = 5
-_BATCH_PERSPECTIVES = [
-    "Emphasize diagnostic reasoning and clinical recognition.",
-    "Emphasize pathophysiology and underlying mechanisms.",
-    "Emphasize management, treatment, and next-best-step decisions.",
-    "Emphasize complications, prognosis, and atypical presentations.",
-    "Emphasize pharmacology, drug mechanisms, and side-effects.",
-]
-STYLE_MODIFIERS = {
-    "basic": (
-        "OVERRIDE: BASIC RECALL MODE. No vignettes. Ultra-short direct factual questions. "
-        "Each question stem ≤15 words, each option 1-2 words. Output exactly 5 options A-E. "
-        "Explanations 1-2 sentences. All in English."
-    ),
-    "cases": (
-        "OVERRIDE: CLINICAL CASES. Present patient scenarios (age, gender, symptoms, vitals). "
-        "Ask for most likely diagnosis, next step, or initial test. No definitions."
-    ),
-    "challenging": (
-        "OVERRIDE: CHALLENGING / TWO-STEP. Highly complex USMLE-style. Require deduction of hidden diagnosis "
-        "then answer about mechanism or rare exception."
-    ),
-}
 
-async def _generate_mcq_chunk(
-    text: str,
-    count: int,
-    difficulty: str,
-    batch_idx: int,
-    total_batches: int,
-    style: str | None = None,
-) -> list[dict]:
-    config = DIFFICULTY_CONFIGS.get(difficulty, DIFFICULTY_CONFIGS["hard"])
-    perspective = _BATCH_PERSPECTIVES[batch_idx % len(_BATCH_PERSPECTIVES)]
-    system_prompt = config["system_prompt"]
-    if style and style in STYLE_MODIFIERS:
-        system_prompt = system_prompt + "\n\n" + STYLE_MODIFIERS[style]
-
-    if total_batches > 1:
-        user_prompt = (
-            f"Generate exactly {count} MCQs at the requested difficulty.\n"
-            f"Batch {batch_idx+1} of {total_batches}. Focus: {perspective}\n"
-            "Do NOT duplicate questions across batches.\n\n"
-            f"SOURCE TEXT:\n{text}"
-        )
-    else:
-        user_prompt = f"Generate exactly {count} MCQs.\n\nSOURCE TEXT:\n{text}"
-
-    for attempt in range(2):
-        raw = await _call_ai_with_fallback(system_prompt, user_prompt, temperature=0.2, max_tokens=4096)
-        json_match = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not json_match:
-            logger.warning(f"No JSON array found, attempt {attempt+1}")
-            continue
-        try:
-            parsed = json.loads(json_match.group(0))
-            if isinstance(parsed, list) and all(isinstance(q, dict) for q in parsed):
-                return parsed
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON decode error, attempt {attempt+1}: {e}")
-    return []
-
-def shuffle_question_options(q: dict) -> dict:
-    letters = ["A", "B", "C", "D", "E"]
-    if "options" not in q or "correct" not in q:
-        return q
-    correct_letter = str(q["correct"]).strip().upper()
-    if correct_letter not in q["options"]:
-        return q
-    items = [(q["options"][L], L == correct_letter) for L in letters if L in q["options"]]
-    if len(items) != 5:
-        return q
-    random.shuffle(items)
-    new_options = {}
-    new_correct = correct_letter
-    for i, (text, is_correct) in enumerate(items):
-        L = letters[i]
-        new_options[L] = text
-        if is_correct:
-            new_correct = L
-    q["options"] = new_options
-    q["correct"] = new_correct
-    return q
-
-async def generate_mcqs(
-    text: str,
-    count: int = 20,
-    difficulty: str = "hard",
-    style: str | None = None,
-) -> list[dict]:
-    MAX_CHARS = 40000
-    if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS]
-    if count <= _MCQ_BATCH_SIZE:
-        questions = await _generate_mcq_chunk(text, count, difficulty, 0, 1, style)
-    else:
-        sizes = []
-        remaining = count
-        while remaining > 0:
-            sizes.append(min(_MCQ_BATCH_SIZE, remaining))
-            remaining -= _MCQ_BATCH_SIZE
-        tasks = [_generate_mcq_chunk(text, sz, difficulty, i, len(sizes), style) for i, sz in enumerate(sizes)]
-        results = await asyncio.gather(*tasks)
-        questions = []
-        for res in results:
-            questions.extend(res)
-        if len(questions) > count:
-            questions = questions[:count]
-    for q in questions:
-        shuffle_question_options(q)
-    return questions
-
-# ----------------------------------------------------------------------
-# SUMMARY GENERATION
-# ----------------------------------------------------------------------
-_SUMMARY_STYLE_PROMPTS = {
-    "disease": (
-        "You are an expert medical professor. Create a high-yield lecture summary using ONLY the provided text.\n"
-        "Structure: *🌟 High-Yield Overview*, *🦠 Etiology & Pathophysiology*, *🩺 Clinical Presentation*, *🔬 Diagnosis & Investigations*, *💊 Management & Treatment*, *💡 Key Pearls*.\n"
-        "Use Telegram Markdown: *bold* for headings and key terms, - for bullets. One idea per bullet. No external knowledge.\n"
-        "All content in English.\n"
-    ),
-    "highyield": (
-        "You are a medical educator. Produce High-Yield board exam notes from the provided text only.\n"
-        "Use *bold* for high-yield facts, emojis for topic headings, - for bullets. Include a 🧠 *Mnemonic:* where possible.\n"
-        "End with *⚡ Quick Recall* (5-7 ultra-condensed bullets). English only.\n"
-    ),
-    "osce": (
-        "You are a clinical educator. Write an OSCE-style clinical approach summary based ONLY on the provided text.\n"
-        "Headings: *📋 History Taking*, *🩺 Physical Examination*, *🔬 Investigations*, *💊 Management*, *⚠️ Red Flags & Complications*, *🗣️ Patient Communication*.\n"
-        "Use bullet points. English only.\n"
-    ),
-}
-
-async def generate_summary(text: str, style: str = "disease") -> str:
-    MAX_CHARS = 40000
-    if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS]
-    system_prompt = _SUMMARY_STYLE_PROMPTS.get(style, _SUMMARY_STYLE_PROMPTS["disease"])
-    user_prompt = f"Summarize the following lecture material:\n\n{text}"
-    return await _call_ai_with_fallback(system_prompt, user_prompt, temperature=0.2, max_tokens=2048)
-
-# ----------------------------------------------------------------------
-# CLINICAL DETECTIVE MODE
-# ----------------------------------------------------------------------
-DETECTIVE_MAX_ROUNDS = 3
-
-def _detective_system_prompt(round_num: int, max_rounds: int) -> str:
-    is_final = round_num >= max_rounds
-    base = (
-        "You are a master clinical simulator running a 'Clinical Detective' case. "
-        "Use the provided background text as the only source of medical facts. "
-        "Do not invent conditions or treatments not mentioned.\n"
-        "Respond in English. Be concise (≤180 words).\n"
-    )
-    if is_final:
-        base += (
-            "FINAL ROUND: Your reply MUST include:\n"
-            "1. Realistic results of the student's move.\n"
-            "2. The CORRECT diagnosis (label 'Diagnosis:').\n"
-            "3. Brief evaluation of the student's reasoning.\n"
-            "4. 2-3 high-yield teaching pearls.\n"
-            "5. Last line exactly: 'Score: X/10'.\n"
-            "Do NOT ask another question."
-        )
-    else:
-        base += (
-            "MID-CASE TURN: Your reply MUST:\n"
-            "1. Give realistic results for the student's move.\n"
-            "2. Drop one subtle clinical clue without revealing the diagnosis.\n"
-            "3. End with exactly: 'What is your next move?'"
-        )
-    return base
-
-async def generate_detective_opening(context_text: str) -> str:
-    context_text = (context_text or "").strip()[:8000]
-    system_prompt = (
-        "You are a master clinical simulator. Build a mysterious, incomplete medical case vignette based ONLY on the provided text.\n"
-        "Present: 1) Chief complaint, 2) Patient demographics + brief history, 3) Vital signs (HR, BP, RR, SpO2, Temp).\n"
-        "Do NOT reveal the diagnosis. End with exactly: 'What is your next move?'\n"
-        "English only, ≤200 words."
-    )
-    user_prompt = f"CONTEXT:\n{context_text}"
-    return await _call_ai_with_fallback(system_prompt, user_prompt, temperature=0.5, max_tokens=600)
-
-async def generate_detective_turn(context_text: str, history: list, round_num: int, max_rounds: int = 3) -> str:
-    context_text = (context_text or "").strip()[:6000]
-    system_prompt = _detective_system_prompt(round_num, max_rounds)
-    conversation = f"{system_prompt}\n\nBackground: {context_text}\n"
-    for m in history:
-        role = m.get("role", "").upper()
-        content = m.get("content", "")
-        conversation += f"{role}: {content}\n"
-    return await _call_ai_with_fallback(system_prompt, conversation, temperature=0.5, max_tokens=800)
-
-# ----------------------------------------------------------------------
-# UTILITIES: PDF / IMAGE / DOCX / TXT extraction
-# ----------------------------------------------------------------------
-_SCANNED_PDF_MIN_CHARS = 50
-_SCANNED_PDF_OCR_PAGES = 5
-_SCANNED_PDF_RENDER_DPI = 200
-
-def _render_scanned_pdf_pages(pdf_bytes: bytes) -> list[bytes]:
-    import fitz
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        page_count = min(len(doc), _SCANNED_PDF_OCR_PAGES)
-        if page_count == 0:
-            return []
-        zoom = _SCANNED_PDF_RENDER_DPI / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
-        out = []
-        for idx in range(page_count):
+async def db_get_questions(file_hash: str, level: str) -> Optional[List[dict]]:
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            row = conn.execute(
+                "SELECT questions_json FROM question_banks WHERE file_hash=? AND level=?",
+                (file_hash, level),
+            ).fetchone()
+            conn.close()
+            if not row:
+                return None
             try:
-                pixmap = doc.load_page(idx).get_pixmap(matrix=matrix, alpha=False)
-                out.append(pixmap.tobytes("jpeg"))
-            except Exception as e:
-                logger.warning(f"Render page {idx+1} failed: {e}")
-                out.append(b"")
-        return out
-    finally:
-        doc.close()
+                data = json.loads(row["questions_json"])
+                return data if isinstance(data, list) else None
+            except Exception:
+                return None
+        return await asyncio.to_thread(work)
 
-def extract_text_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
-    system_prompt = "You are an OCR engine. Extract all text from this image exactly as written. Do not summarize. Output only the raw text."
-    user_prompt = f"Image data: data:image/jpeg;base64,{base64_image}"
-    # Use Gemini synchronously for simplicity
-    full_prompt = f"{system_prompt}\n\n{user_prompt}"
-    response = gemini_model.generate_content(
-        full_prompt,
-        generation_config=genai.types.GenerationConfig(temperature=0.0, max_output_tokens=2000)
-    )
-    return response.text.strip()
 
+async def db_save_questions(file_hash: str, level: str, questions: List[dict]) -> None:
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO question_banks(file_hash, level, questions_json, created_at)
+                VALUES(?,?,?,?)
+                """,
+                (file_hash, level, json.dumps(questions, ensure_ascii=False), datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(work)
+
+
+async def db_get_summary(file_hash: str, style: str) -> Optional[str]:
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            row = conn.execute(
+                "SELECT summary_text FROM summaries WHERE file_hash=? AND style=?",
+                (file_hash, style),
+            ).fetchone()
+            conn.close()
+            return row["summary_text"] if row else None
+        return await asyncio.to_thread(work)
+
+
+async def db_save_summary(file_hash: str, style: str, summary: str) -> None:
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO summaries(file_hash, style, summary_text, created_at)
+                VALUES(?,?,?,?)
+                """,
+                (file_hash, style, summary, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(work)
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+user_last_request: Dict[int, float] = {}
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def escape_md(text: object) -> str:
+    value = "" if text is None else str(text)
+    for ch in ("*", "_", "`", "["):
+        value = value.replace(ch, f"\\{ch}")
+    return value
+
+
+def progress_bar(current: int, total: int, width: int = 12) -> str:
+    if total <= 0:
+        return "░" * width + " 0%"
+    filled = round(current / total * width)
+    pct = round(current / total * 100)
+    return "█" * filled + "░" * (width - filled) + f" {pct}%"
+
+
+async def cooldown_guard(update: Update, user_data: dict, user_id: int) -> bool:
+    now = time.time()
+    last = user_last_request.get(user_id, 0)
+    if now - last < COOLDOWN_SECONDS:
+        wait = int(COOLDOWN_SECONDS - (now - last))
+        await update.effective_message.reply_text(t(user_data, "cooldown", wait=wait))
+        return True
+    user_last_request[user_id] = now
+    return False
+
+
+def get_stats(user_data: dict) -> dict:
+    if "stats" not in user_data:
+        user_data["stats"] = {
+            "quizzes": 0,
+            "correct": 0,
+            "total": 0,
+            "best": 0,
+        }
+    return user_data["stats"]
+
+
+def update_stats(user_data: dict, score: int, total: int) -> None:
+    stats = get_stats(user_data)
+    pct = round(score / total * 100) if total else 0
+    stats["quizzes"] += 1
+    stats["correct"] += score
+    stats["total"] += total
+    if pct > stats["best"]:
+        stats["best"] = pct
+
+
+# =============================================================================
+# GEMINI
+# =============================================================================
+async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: int = 4096) -> str:
+    async with _GEMINI_SEMAPHORE:
+        def work():
+            response = gemini_model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                ),
+            )
+            return (response.text or "").strip()
+        return await asyncio.to_thread(work)
+
+
+async def extract_text_from_image(image_bytes: bytes, mime_type: str) -> str:
+    async with _GEMINI_SEMAPHORE:
+        def work():
+            response = gemini_model.generate_content(
+                [
+                    "Extract all readable text from this medical image exactly. Do not summarize. Return only raw text.",
+                    {"mime_type": mime_type or "image/jpeg", "data": image_bytes},
+                ],
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0,
+                    max_output_tokens=4096,
+                ),
+            )
+            return (response.text or "").strip()
+        return await asyncio.to_thread(work)
+
+
+# =============================================================================
+# TEXT EXTRACTION
+# =============================================================================
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
@@ -630,921 +454,886 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         s = page.extract_text()
         if s:
             pages.append(s.strip())
-    text = "\n\n".join(pages)
-    if len(text.strip()) >= _SCANNED_PDF_MIN_CHARS:
-        return text
-    logger.info("Text layer too short, falling back to OCR")
-    try:
-        # Fallback OCR using Gemini (simplified)
-        pages_jpeg = _render_scanned_pdf_pages(pdf_bytes)
-        ocr_chunks = []
-        for jpeg in pages_jpeg:
-            if jpeg:
-                ocr_chunks.append(extract_text_from_image(jpeg, "image/jpeg"))
-        ocr_text = "\n\n".join(ocr_chunks)
-        return ocr_text if ocr_text.strip() else text
-    except Exception as e:
-        logger.error(f"OCR fallback failed: {e}")
-        return text
+    return "\n\n".join(pages).strip()
 
-async def extract_text_from_pdf_async(pdf_bytes: bytes) -> str:
-    return await asyncio.to_thread(extract_text_from_pdf, pdf_bytes)
 
 def extract_text_from_docx(docx_bytes: bytes) -> str:
     doc = Document(io.BytesIO(docx_bytes))
-    parts = [para.text for para in doc.paragraphs if para.text.strip()]
+    parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     return "\n\n".join(parts)
+
 
 def extract_text_from_txt(txt_bytes: bytes) -> str:
     for enc in ("utf-8", "utf-16", "latin-1"):
         try:
             return txt_bytes.decode(enc)
         except UnicodeDecodeError:
-            continue
+            pass
     return txt_bytes.decode("utf-8", errors="replace")
 
-# ----------------------------------------------------------------------
-# STATS (simple quiz statistics)
-# ----------------------------------------------------------------------
-def get_stats(user_data: dict) -> dict:
-    if "stats" not in user_data:
-        user_data["stats"] = {
-            "quizzes_completed": 0,
-            "total_correct": 0,
-            "total_questions": 0,
-            "highest_pct": 0,
-            "difficulty_counts": {"easy": 0, "medium": 0, "hard": 0, "nightmare": 0},
-        }
-    return user_data["stats"]
 
-def update_stats(user_data: dict, score: int, total: int, difficulty: str) -> None:
-    stats = get_stats(user_data)
-    pct = round(score / total * 100) if total > 0 else 0
-    stats["quizzes_completed"] += 1
-    stats["total_correct"] += score
-    stats["total_questions"] += total
-    if pct > stats["highest_pct"]:
-        stats["highest_pct"] = pct
-    dc = stats.setdefault("difficulty_counts", {})
-    dc[difficulty] = dc.get(difficulty, 0) + 1
+async def extract_text(file_type: str, raw_bytes: bytes, mime_type: str) -> str:
+    if file_type == "pdf":
+        return await asyncio.to_thread(extract_text_from_pdf, raw_bytes)
+    if file_type == "docx":
+        return await asyncio.to_thread(extract_text_from_docx, raw_bytes)
+    if file_type == "txt":
+        return await asyncio.to_thread(extract_text_from_txt, raw_bytes)
+    if file_type == "image":
+        return await extract_text_from_image(raw_bytes, mime_type)
+    return ""
 
-def format_stats_text(user_data: dict, name: str | None = None) -> str:
-    lang = get_lang(user_data)
-    stats = get_stats(user_data)
-    total_q = stats["total_questions"]
-    total_c = stats["total_correct"]
-    accuracy = round(total_c / total_q * 100) if total_q > 0 else 0
-    display_name = (name or "—").strip() or "—"
-    best = stats.get("highest_pct", 0)
-    fav = max(stats.get("difficulty_counts", {}).items(), key=lambda x: x[1])[0] if stats.get("difficulty_counts") else "—"
-    return (
-        f"{t('stats_header', lang)}\n\n"
-        f"👤 {display_name}\n"
-        f"{t('stats_quizzes', lang)} {stats['quizzes_completed']}\n"
-        f"{t('stats_correct', lang)} {total_c} / {total_q}\n"
-        f"{t('stats_accuracy', lang)} {accuracy}%\n"
-        f"{t('stats_best', lang)} {best}%\n"
-        f"{t('stats_fav', lang)} {fav}"
-    )
 
-# ----------------------------------------------------------------------
-# TELEGRAM HELPERS (keyboards, send functions)
-# ----------------------------------------------------------------------
-def build_language_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🇬🇧 English", callback_data="lang:en"),
-        InlineKeyboardButton("🇸🇦 العربية", callback_data="lang:ar"),
-    ]])
+# =============================================================================
+# PROMPTS
+# =============================================================================
+LEVEL_LIMITS = {
+    "basic": 50,
+    "cases": 5,
+    "challenge": 2,
+}
 
-def build_mode_keyboard(lang: str) -> InlineKeyboardMarkup:
+BASIC_COUNTS = (5, 10, 20, 30, 40)
+
+QUESTION_SCHEMA = """ Return valid JSON array only. No markdown. No prose outside JSON. Each item must be: {
+    "question": "...",
+    "options": {"A":"...", "B":"...", "C":"...", "D":"...", "E":"..."},
+    "correct": "A",
+    "explanation": "..."
+}
+Rules:
+- Exactly 5 options A-E.
+- correct must be one of A/B/C/D/E.
+- Base every question only on the source text.
+- If the text does not support many questions, generate fewer.
+- Do not invent facts outside the source text.
+- English only.
+"""
+
+
+LEVEL_PROMPTS = {
+    "basic": f"""
+You are a medical teacher creating BASIC direct MCQs. Question style:
+- Direct recall only.
+- Definitions, simple facts, causes, symptoms, diagnosis, management if directly mentioned.
+- No clinical vignettes.
+- Short question stems.
+- Simple options.
+- Suitable for quick memorization.
+{QUESTION_SCHEMA}
+""",
+    "cases": f"""
+You are a medical teacher creating CLINICAL CASE MCQs. Question style:
+- Short patient scenarios.
+- Age, sex, complaint, 1-3 key findings if supported by source.
+- Ask most likely diagnosis, next step, complication, or investigation.
+- Maximum integration, but only from source text.
+{QUESTION_SCHEMA}
+""",
+    "challenge": f"""
+You are a strict medical examiner creating CHALLENGE MCQs. Question style:
+- Harder two-step reasoning.
+- Trap options, but fair.
+- Requires connecting several ideas in the source text.
+- Strong explanation explaining why the correct option is right and why a tempting wrong option is wrong.
+{QUESTION_SCHEMA}
+""",
+}
+
+
+SUMMARY_PROMPTS = {
+    "disease": """
+You are an expert medical professor. Create a high-yield medical lecture summary using ONLY the source text. Use Telegram Markdown. Structure:
+🌟 Overview
+🦠 Etiology / Pathophysiology
+🩺 Clinical Presentation
+🔬 Diagnosis / Investigations
+💊 Management
+⚠️ Complications / Red Flags
+💡 Key Pearls
+If a section is not mentioned in the source, write: Not mentioned in the lecture.
+English only.
+""",
+    "highyield": """
+You are a board-exam tutor. Create concise high-yield notes using ONLY the source text. Use Telegram Markdown, bold key facts, and bullet points. End with ⚡ Quick Recall containing 7-12 ultra-short bullets.
+English only.
+""",
+    "osce": """
+You are a clinical educator. Create an OSCE-style clinical approach using ONLY the source text. Use Telegram Markdown. Headings:
+📋 History
+🩺 Examination
+🔬 Investigations
+💊 Management
+🗣️ Counseling / Communication
+⚠️ Red Flags
+If not mentioned, say Not mentioned in the lecture.
+English only.
+""",
+}
+
+
+# =============================================================================
+# QUESTION GENERATION + VALIDATION
+# =============================================================================
+def extract_json_array(raw: str) -> Optional[list]:
+    """Extract a JSON array safely from Gemini output."""
+    raw = (raw or "").strip()
+
+    # Try direct parse
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else None
+    except Exception:
+        pass
+
+    # Find first '[' and last ']' using proper regex: \[.*\] with DOTALL
+    match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+    if not match:
+        return None
+
+    candidate = match.group(0)
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, list) else None
+    except Exception:
+        return None
+
+
+def normalize_questions(items: list) -> List[dict]:
+    clean: List[dict] = []
+    for q in items:
+        if not isinstance(q, dict):
+            continue
+        question = str(q.get("question", "")).strip()
+        options = q.get("options")
+        correct = str(q.get("correct", "")).strip().upper()
+        explanation = str(q.get("explanation", "")).strip()
+        if not question or not isinstance(options, dict) or correct not in "ABCDE":
+            continue
+        normalized_options = {}
+        ok = True
+        for letter in "ABCDE":
+            val = str(options.get(letter, "")).strip()
+            if not val:
+                ok = False
+                break
+            normalized_options[letter] = val
+        if not ok or correct not in normalized_options:
+            continue
+        clean.append({
+            "question": question,
+            "options": normalized_options,
+            "correct": correct,
+            "explanation": explanation or "Based on the lecture text.",
+        })
+    return clean
+
+
+def shuffle_options(q: dict) -> dict:
+    letters = list("ABCDE")
+    opts = q.get("options", {})
+    correct = q.get("correct", "").upper()
+    if correct not in letters or any(l not in opts for l in letters):
+        return q
+    pairs = [(opts[l], l == correct) for l in letters]
+    random.shuffle(pairs)
+    new_opts = {}
+    new_correct = "A"
+    for idx, (text, is_correct) in enumerate(pairs):
+        letter = letters[idx]
+        new_opts[letter] = text
+        if is_correct:
+            new_correct = letter
+    q = dict(q)
+    q["options"] = new_opts
+    q["correct"] = new_correct
+    return q
+
+
+async def generate_question_bank(text: str, level: str) -> List[dict]:
+    limit = LEVEL_LIMITS[level]
+    source = text[:MAX_TEXT_CHARS_FOR_AI]
+    prompt = f"""
+{LEVEL_PROMPTS[level]}
+
+Create up to {limit} questions for this level. Important: generate fewer than {limit} if the lecture does not contain enough information.
+
+SOURCE TEXT:
+{source}
+"""
+    raw = await call_gemini(prompt, temperature=0.15, max_output_tokens=8192)
+    parsed = extract_json_array(raw)
+    if parsed is None:
+        logger.warning("Gemini returned invalid JSON for %s: %s", level, raw[:500])
+        return []
+    questions = normalize_questions(parsed)
+    return questions[:limit]
+
+
+async def get_or_create_question_bank(file_hash: str, text: str, level: str) -> List[dict]:
+    cached = await db_get_questions(file_hash, level)
+    if cached is not None:
+        return cached
+    questions = await generate_question_bank(text, level)
+    if questions:
+        await db_save_questions(file_hash, level, questions)
+    return questions
+
+
+async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
+    cached = await db_get_summary(file_hash, style)
+    if cached:
+        return cached
+    source = text[:MAX_TEXT_CHARS_FOR_AI]
+    prompt = f"""
+{SUMMARY_PROMPTS.get(style, SUMMARY_PROMPTS['disease'])}
+
+SOURCE TEXT:
+{source}
+"""
+    summary = await call_gemini(prompt, temperature=0.2, max_output_tokens=4096)
+    if summary:
+        await db_save_summary(file_hash, style, summary)
+    return summary
+
+
+# =============================================================================
+# KEYBOARDS
+# =============================================================================
+def lang_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_mode_quiz", lang), callback_data="mode:quiz")],
-        [InlineKeyboardButton(t("btn_mode_summary", lang), callback_data="mode:summary")],
-        [InlineKeyboardButton(t("btn_mode_detective", lang), callback_data="mode:detective")],
+        [InlineKeyboardButton("🇸🇦 العربية", callback_data="lang:ar"),
+         InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")]
     ])
 
-def build_summary_style_keyboard(lang: str) -> InlineKeyboardMarkup:
+
+def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("btn_style_disease", lang), callback_data="style:disease")],
-        [InlineKeyboardButton(t("btn_style_highyield", lang), callback_data="style:highyield")],
-        [InlineKeyboardButton(t("btn_style_osce", lang), callback_data="style:osce")],
-        [InlineKeyboardButton(t("btn_back", lang), callback_data="setup:back")],
+        [InlineKeyboardButton(t(user_data, "mode_quiz"), callback_data="mode:quiz")],
+        [InlineKeyboardButton(t(user_data, "mode_summary"), callback_data="mode:summary")],
     ])
 
-def build_question_style_keyboard(setup_id: str) -> InlineKeyboardMarkup:
-    def cb(style: str) -> str:
-        return f"qstyle:{setup_id}:{style}"
+
+def summary_style_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Basic MCQs", callback_data=cb("basic"))],
-        [InlineKeyboardButton("🩺 Clinical Cases", callback_data=cb("cases"))],
-        [InlineKeyboardButton("🧠 Challenging", callback_data=cb("challenging"))],
+        [InlineKeyboardButton(t(user_data, "style_disease"), callback_data="style:disease")],
+        [InlineKeyboardButton(t(user_data, "style_highyield"), callback_data="style:highyield")],
+        [InlineKeyboardButton(t(user_data, "style_osce"), callback_data="style:osce")],
     ])
 
-def build_difficulty_keyboard(lang: str, setup_id: str) -> InlineKeyboardMarkup:
-    def cb(level: str) -> str:
-        return f"difficulty:{setup_id}:{level}"
+
+def level_keyboard(setup_id: str, user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t("diff_easy", lang), callback_data=cb("easy"))],
-        [InlineKeyboardButton(t("diff_medium", lang), callback_data=cb("medium"))],
-        [InlineKeyboardButton(t("diff_hard", lang), callback_data=cb("hard"))],
-        [InlineKeyboardButton(t("diff_nightmare", lang), callback_data=cb("nightmare"))],
+        [InlineKeyboardButton(t(user_data, "level_basic"), callback_data=f"level:{setup_id}:basic")],
+        [InlineKeyboardButton(t(user_data, "level_cases"), callback_data=f"level:{setup_id}:cases")],
+        [InlineKeyboardButton(t(user_data, "level_challenge"), callback_data=f"level:{setup_id}:challenge")],
     ])
 
-def build_count_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("5", callback_data="count:5"),
-        InlineKeyboardButton("10", callback_data="count:10"),
-        InlineKeyboardButton("20", callback_data="count:20"),
-        InlineKeyboardButton("35", callback_data="count:35"),
-        InlineKeyboardButton("50", callback_data="count:50"),
-    ]])
 
-def build_question_keyboard(quiz_id: str, question_idx: int) -> InlineKeyboardMarkup:
-    def cb(letter: str) -> str:
-        return f"answer:{quiz_id}:{question_idx}:{letter}"
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("  A  ", callback_data=cb("A")),
-        InlineKeyboardButton("  B  ", callback_data=cb("B")),
-        InlineKeyboardButton("  C  ", callback_data=cb("C")),
-        InlineKeyboardButton("  D  ", callback_data=cb("D")),
-        InlineKeyboardButton("  E  ", callback_data=cb("E")),
-    ]])
+def basic_count_keyboard(setup_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5", callback_data=f"count:{setup_id}:5"),
+            InlineKeyboardButton("10", callback_data=f"count:{setup_id}:10"),
+            InlineKeyboardButton("20", callback_data=f"count:{setup_id}:20"),
+        ],
+        [
+            InlineKeyboardButton("30", callback_data=f"count:{setup_id}:30"),
+            InlineKeyboardButton("40", callback_data=f"count:{setup_id}:40"),
+        ],
+    ])
 
-def build_post_quiz_keyboard(has_wrong: bool, lang: str) -> InlineKeyboardMarkup:
+
+def answer_keyboard(quiz_id: str, idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f" {l} ", callback_data=f"ans:{quiz_id}:{idx}:{l}") for l in "ABCDE"]
+    ])
+
+
+def post_quiz_keyboard(user_data: dict, has_wrong: bool) -> InlineKeyboardMarkup:
     rows = []
     if has_wrong:
-        rows.append([InlineKeyboardButton(t("btn_review", lang), callback_data="rv:start")])
-    rows.append([InlineKeyboardButton(t("btn_stats", lang), callback_data="rv:stats")])
-    rows.append([InlineKeyboardButton(t("btn_new_quiz", lang), callback_data="rv:new")])
+        rows.append([InlineKeyboardButton(t(user_data, "review"), callback_data="review:start")])
+    rows.append([InlineKeyboardButton(t(user_data, "stats"), callback_data="review:stats")])
+    rows.append([InlineKeyboardButton(t(user_data, "new_quiz"), callback_data="review:new")])
     return InlineKeyboardMarkup(rows)
 
-def build_stats_keyboard(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([])  # No extra buttons
 
-def build_review_nav_keyboard(current: int, total: int, lang: str) -> InlineKeyboardMarkup:
+def review_keyboard(current: int, total: int) -> InlineKeyboardMarkup:
     buttons = []
     if current < total - 1:
-        buttons.append(InlineKeyboardButton(t("btn_review_next", lang), callback_data="rv:next"))
-    buttons.append(InlineKeyboardButton(t("btn_review_exit", lang), callback_data="rv:exit"))
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data="review:next"))
+    buttons.append(InlineKeyboardButton("Done ✖", callback_data="review:exit"))
     return InlineKeyboardMarkup([buttons])
 
-def progress_bar(current: int, total: int, width: int = 12) -> str:
-    filled = round(current / total * width) if total > 0 else 0
-    bar = "█" * filled + "░" * (width - filled)
-    pct = round(current / total * 100) if total > 0 else 0
-    return f"{bar}  {pct}%"
 
-def escape_md(text: object) -> str:
-    text = "" if text is None else str(text)
-    for ch in ("*", "_", "`", "["):
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-def format_question(q: dict, index: int, total: int, difficulty: str, lang: str) -> str:
-    opts = q.get("options") or {}
-    bar = progress_bar(index, total)
-    def opt(key: str) -> str:
-        return escape_md(opts.get(key) or f"[{key}?]")
+# =============================================================================
+# FORMATTING
+# =============================================================================
+def format_question(q: dict, idx: int, total: int, user_data: dict) -> str:
+    opts = q.get("options", {})
     return (
-        f"`{bar}`\n"
-        f"*{t('meta_question', lang, i=index, n=total)}* ·   {diff_label(difficulty, lang)}\n"
-        f"\n{escape_md(q.get('question') or '')}\n\n"
-        f"*A.* {opt('A')}\n*B.* {opt('B')}\n*C.* {opt('C')}\n*D.* {opt('D')}\n*E.* {opt('E')}"
+        f"{progress_bar(idx, total)}\n"
+        f"{t(user_data, 'q_meta', i=idx, n=total)}\n\n"
+        f"{escape_md(q.get('question', ''))}\n\n"
+        f"A. {escape_md(opts.get('A', ''))}\n"
+        f"B. {escape_md(opts.get('B', ''))}\n"
+        f"C. {escape_md(opts.get('C', ''))}\n"
+        f"D. {escape_md(opts.get('D', ''))}\n"
+        f"E. {escape_md(opts.get('E', ''))}"
     )
 
-def format_plain_question(q: dict, index: int, total: int) -> str:
-    opts = q.get("options") or {}
-    def opt(key: str) -> str:
-        return str(opts.get(key) or f"[{key}?]")
-    return f"Q{index}/{total}\n\n{q.get('question') or ''}\n\nA. {opt('A')}\nB. {opt('B')}\nC. {opt('C')}\nD. {opt('D')}\nE. {opt('E')}"
 
-def format_review_question(entry: dict, index: int, total: int, lang: str) -> str:
+def format_review(entry: dict, idx: int, total: int, user_data: dict) -> str:
     q = entry["question"]
     chosen = entry["chosen"]
-    correct = q["correct"].upper()
+    correct = q["correct"]
     opts = q["options"]
-    if chosen == "—":
-        your_line = f"{t('review_your', lang)} —   {t('review_timeout_short', lang)}"
-    elif chosen == correct:
-        your_line = f"{t('review_your', lang)} *{chosen}* {t('review_correct_short', lang)}"
-    else:
-        your_line = f"{t('review_your', lang)} *{chosen}* {t('review_wrong_short', lang)}"
     return (
-        f"{t('review_header', lang, i=index, n=total)}\n\n"
+        f"📋 Review {idx}/{total}\n\n"
         f"{escape_md(q['question'])}\n\n"
-        f"*A.* {escape_md(opts['A'])}\n*B.* {escape_md(opts['B'])}\n*C.* {escape_md(opts['C'])}\n*D.* {escape_md(opts['D'])}\n*E.* {escape_md(opts['E'])}\n\n"
-        f"{your_line}\n"
-        f"{t('answer_label', lang)} *{correct}.* {escape_md(opts[correct])}\n\n"
-        f"{t('explanation', lang)} {escape_md(q['explanation'])}"
+        f"A. {escape_md(opts['A'])}\n"
+        f"B. {escape_md(opts['B'])}\n"
+        f"C. {escape_md(opts['C'])}\n"
+        f"D. {escape_md(opts['D'])}\n"
+        f"E. {escape_md(opts['E'])}\n\n"
+        f"Your answer: {chosen}\n"
+        f"Correct answer: {correct}. {escape_md(opts[correct])}\n\n"
+        f"{t(user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
     )
 
-async def _safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
-    for attempt in range(1, 3):
+
+# =============================================================================
+# SENDERS
+# =============================================================================
+async def safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
+    for attempt in range(2):
         try:
             await bot.send_message(chat_id=chat_id, text=text, **kwargs)
             return True
         except Exception as e:
-            logger.warning(f"send_message attempt {attempt} failed: {e}")
-            if attempt == 1:
-                await asyncio.sleep(1.0)
+            logger.warning("send failed attempt %s: %s", attempt + 1, e)
+            await asyncio.sleep(0.5)
     return False
 
-async def _send_question(chat_id: int, user_data: dict, bot) -> bool:
-    session = user_data.get("session")
+
+async def send_current_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    session = context.user_data.get("session")
     if not session:
-        return False
-    questions = session["questions"]
+        return
     idx = session["current"]
-    lang = get_lang(user_data)
-    if idx >= len(questions):
-        return await _send_final_score(chat_id, user_data, bot)
-    q = questions[idx]
-    quiz_id = session["quiz_id"]
-    keyboard = build_question_keyboard(quiz_id, idx)
-    md_text = format_question(q, idx+1, len(questions), session["difficulty"], lang)
-    sent = await _safe_send(bot, chat_id, md_text, parse_mode="Markdown", reply_markup=keyboard)
-    if not sent:
-        plain = format_plain_question(q, idx+1, len(questions))
-        sent = await _safe_send(bot, chat_id, plain, reply_markup=keyboard)
-    if not sent:
-        logger.error(f"Failed to send Q{idx+1}/{len(questions)}")
-        await _safe_send(bot, chat_id, t("send_failed_alive", lang))
-        return False
-    return True
-
-async def _send_final_score(chat_id: int, user_data: dict, bot) -> bool:
-    session = user_data.get("session")
-    if not session:
-        return False
-    lang = get_lang(user_data)
-    score = session["score"]
     questions = session["questions"]
-    total = len(questions)
-    pct = round(score / total * 100) if total > 0 else 0
-    diff = session["difficulty"]
-    wrong_answers = session.get("wrong_answers", [])
-    wrong_count = len(wrong_answers)
-    if pct >= 90: grade_key = "grade_outstanding"
-    elif pct >= 80: grade_key = "grade_excellent"
-    elif pct >= 70: grade_key = "grade_good"
-    elif pct >= 60: grade_key = "grade_satisfactory"
-    elif pct >= 40: grade_key = "grade_review"
-    else: grade_key = "grade_study"
-    bar = progress_bar(total, total)
-    msg = (
-        f"{t('complete_title', lang)}\n\n`{bar}`\n\n"
-        f"{t('lbl_score', lang)}        `{score} / {total}`   ({pct}%)\n"
-        f"{t('lbl_grade', lang)}        {t(grade_key, lang)}\n"
-        f"{t('lbl_difficulty', lang)}   {diff_label(diff, lang)}"
+    if idx >= len(questions):
+        await send_final_score(chat_id, context)
+        return
+    text = format_question(questions[idx], idx + 1, len(questions), context.user_data)
+    ok = await safe_send(
+        context.bot,
+        chat_id,
+        text,
+        parse_mode="Markdown",
+        reply_markup=answer_keyboard(session["quiz_id"], idx),
     )
-    if wrong_count > 0:
-        plural = "" if wrong_count == 1 else ("s" if lang == "en" else "")
-        msg += f"\n\n{t('wrong_count', lang, n=wrong_count, plural=plural)}"
-    keyboard = build_post_quiz_keyboard(has_wrong=bool(wrong_answers), lang=lang)
-    sent = await _safe_send(bot, chat_id, msg, parse_mode="Markdown", reply_markup=keyboard)
-    if not sent:
-        sent = await _safe_send(bot, chat_id, t("plain_final", lang, score=score, total=total, pct=pct), reply_markup=keyboard)
-    if not sent:
-        logger.error("Final score delivery failed")
-        return False
-    update_stats(user_data, score, total, diff)
-    user_data.pop("session", None)
-    user_data["review_pool"] = wrong_answers if wrong_answers else []
-    return True
+    if not ok:
+        await context.bot.send_message(chat_id=chat_id, text="Could not send question due to Telegram formatting issue.")
 
-# ----------------------------------------------------------------------
-# QUEUE WORKER (background processing)
-# ----------------------------------------------------------------------
-async def _queue_worker():
-    while True:
-        try:
-            coro, future = await _REQUEST_QUEUE.get()
-            async with _API_SEMAPHORE:
-                result = await coro
-            future.set_result(result)
-        except Exception as e:
-            future.set_exception(e)
-        finally:
-            _REQUEST_QUEUE.task_done()
 
-def _start_queue_workers(count: int = 5):
-    for _ in range(count):
-        asyncio.create_task(_queue_worker())
+async def send_final_score(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    session = context.user_data.get("session")
+    if not session:
+        return
+    total = len(session["questions"])
+    score = session["score"]
+    pct = round(score / total * 100) if total else 0
+    wrong = session.get("wrong", [])
+    update_stats(context.user_data, score, total)
+    text = t(context.user_data, "complete", score=score, total=total, pct=pct)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=post_quiz_keyboard(context.user_data, bool(wrong)),
+    )
+    context.user_data["review_pool"] = wrong
+    context.user_data.pop("session", None)
 
-async def enqueue_request(coro):
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    await _REQUEST_QUEUE.put((coro, future))
-    return await future
 
-# ----------------------------------------------------------------------
-# TELEGRAM HANDLERS (commands, callbacks, messages)
-# ----------------------------------------------------------------------
+# =============================================================================
+# COMMANDS
+# =============================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("awaiting_nickname", None)
-    await update.message.reply_text(
-        "Welcome to your Smart Medical Assistant! 🩺\nPlease choose your language:\n\n"
-        "أهلاً بك في مساعدك الطبي الذكي! 🩺\nيرجى اختيار لغتك:",
-        reply_markup=build_language_keyboard()
-    )
+    await update.message.reply_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(context.user_data)
-    await update.message.reply_text(t("help", lang), parse_mode=None)
+    await update.message.reply_text(t(context.user_data, "help"))
 
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ud = context.user_data
-    lang = get_lang(ud)
-    had_state = any(k in ud for k in ("session", "setup_id", "pending_text", "review", "detective"))
-    for k in ("session", "setup_id", "pending_text", "pending_difficulty", "pending_style",
-              "selected_style", "pending_count", "pending_mode", "pending_summary_style",
-              "review", "review_pool", "detective"):
-        ud.pop(k, None)
-    await update.message.reply_text(t("stopped" if had_state else "no_active", lang))
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    name = (user.first_name or user.full_name) if user else None
-    lang = get_lang(context.user_data)
-    await update.message.reply_text(
-        format_stats_text(context.user_data, name=name),
-        parse_mode="Markdown",
-        reply_markup=build_stats_keyboard(lang),
-    )
-
-async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(context.user_data)
-    pool = context.user_data.get("review_pool", [])
-    if not pool:
-        await update.message.reply_text(t("review_none", lang))
-        return
-    context.user_data["review"] = {"pool": pool, "current": 0}
-    await send_review_question(update.effective_chat.id, context)
-
-async def send_review_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(context.user_data)
-    review = context.user_data.get("review")
-    if not review:
-        await context.bot.send_message(chat_id=chat_id, text=t("review_no_active", lang))
-        return
-    pool = review["pool"]
-    current = review["current"]
-    if current >= len(pool):
-        context.user_data.pop("review", None)
-        await context.bot.send_message(chat_id=chat_id, text=t("review_complete", lang), parse_mode="Markdown")
-        return
-    entry = pool[current]
-    text = format_review_question(entry, current+1, len(pool), lang)
-    keyboard = build_review_nav_keyboard(current, len(pool), lang)
-    await _safe_send(context.bot, chat_id, text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(context.user_data)
-    await update.message.reply_text(t("choose_lang", lang), reply_markup=build_language_keyboard())
+    await update.message.reply_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
 
-async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(context.user_data)
-    keyboard = [[InlineKeyboardButton(t("support_madar", lang), callback_data="support_madar")]]
-    await update.message.reply_text(t("support_text", lang), reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    lang = get_lang(context.user_data)
-    if query.data == "support_madar":
-        await query.edit_message_text(t("support_details", lang))
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    had = any(k in context.user_data for k in ("session", "pending_file", "review"))
+    for k in ("session", "pending_file", "pending_mode", "pending_summary_style", "review", "review_pool", "busy"):
+        context.user_data.pop(k, None)
+    await update.message.reply_text(t(context.user_data, "stopped" if had else "no_active"))
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = get_stats(context.user_data)
+    total = stats["total"]
+    accuracy = round(stats["correct"] / total * 100) if total else 0
+    await update.message.reply_text(
+        t(context.user_data,
+          "stats_text",
+          quizzes=stats["quizzes"],
+          correct=stats["correct"],
+          total=total,
+          accuracy=accuracy,
+          best=stats["best"])
+    )
+
+
+async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pool = context.user_data.get("review_pool", [])
+    if not pool:
+        await update.message.reply_text(t(context.user_data, "review_none"))
+        return
+    context.user_data["review"] = {"pool": pool, "current": 0}
+    await send_review(update.effective_chat.id, context)
+
 
 async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not _is_admin(user.id):
+    if not user or user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("Unauthorized.")
         return
-    await update.message.reply_text("🧪 Self-test running...")
     try:
-        test_response = await _call_ai_with_fallback("You are a helpful assistant.", "Say 'OK'", temperature=0.0, max_tokens=10)
-        if "OK" in test_response:
-            await update.message.reply_text("✅ AI test passed.")
-        else:
-            await update.message.reply_text("⚠️ AI test returned unexpected output.")
+        reply = await call_gemini("Reply with exactly: OK", temperature=0.0, max_output_tokens=10)
+        await update.message.reply_text(f"✅ Gemini response: {reply[:50]}")
     except Exception as e:
-        await update.message.reply_text(f"❌ AI test failed: {e}")
+        await update.message.reply_text(f"❌ Gemini failed: {e}")
 
-async def handle_setlang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# =============================================================================
+# CALLBACKS
+# =============================================================================
+async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    parts = query.data.split(":")
-    if len(parts) != 2 or parts[1] not in SUPPORTED_LANGS:
+    _, lang = query.data.split(":", 1)
+    if lang not in SUPPORTED_LANGS:
         return
-    lang = parts[1]
     context.user_data["lang"] = lang
-    await query.message.delete()
-    user = update.effective_user
-    name_html = user.mention_html() if user else ""
+    await query.edit_message_text(t(context.user_data, "welcome"))
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=t("welcome", lang, name=name_html),
-        parse_mode="HTML",
-    )
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=t("choose_mode", lang),
-        parse_mode="Markdown",
-        reply_markup=build_mode_keyboard(lang),
+        text=t(context.user_data, "choose_mode"),
+        reply_markup=mode_keyboard(context.user_data),
     )
 
-async def handle_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    if len(parts) != 2 or parts[1] not in SUPPORTED_LANGS:
-        return
-    lang = parts[1]
-    context.user_data["lang"] = lang
-    await query.edit_message_text(t("lang_set", lang))
-    user = update.effective_user
-    name_html = user.mention_html() if user else ""
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=t("welcome", lang, name=name_html),
-        parse_mode="HTML",
-    )
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=t("choose_mode", lang),
-        parse_mode="Markdown",
-        reply_markup=build_mode_keyboard(lang),
-    )
 
-async def handle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    parts = query.data.split(":")
-    if len(parts) != 2 or parts[1] not in ("quiz", "summary", "detective"):
+    _, mode = query.data.split(":", 1)
+    if mode not in ("quiz", "summary"):
         return
-    mode = parts[1]
-    lang = get_lang(context.user_data)
-    context.user_data.pop("detective", None)
     context.user_data["pending_mode"] = mode
-    await query.edit_message_reply_markup()
+    await query.edit_message_reply_markup(reply_markup=None)
     if mode == "summary":
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=t("choose_summary_style", lang),
-            reply_markup=build_summary_style_keyboard(lang),
-        )
-    elif mode == "detective":
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=t("mode_detective_prompt", lang),
-            parse_mode="Markdown",
+            text=t(context.user_data, "summary_style_prompt"),
+            reply_markup=summary_style_keyboard(context.user_data),
         )
     else:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=t("mode_quiz_prompt", lang),
-            parse_mode="Markdown",
-        )
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "mode_quiz_prompt"))
 
-async def handle_setup_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def summary_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    lang = get_lang(context.user_data)
-    context.user_data.pop("pending_mode", None)
-    await query.edit_message_text(
-        text=t("choose_mode", lang),
-        parse_mode="Markdown",
-        reply_markup=build_mode_keyboard(lang),
-    )
-
-async def handle_summary_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    if len(parts) != 2 or parts[1] not in ("disease", "highyield", "osce"):
+    _, style = query.data.split(":", 1)
+    if style not in SUMMARY_PROMPTS:
         return
-    style = parts[1]
-    lang = get_lang(context.user_data)
     context.user_data["pending_summary_style"] = style
-    await query.edit_message_reply_markup()
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=t(f"style_selected_{style}", lang),
-        parse_mode="Markdown",
-    )
+    context.user_data["pending_mode"] = "summary"
+    await query.edit_message_reply_markup(reply_markup=None)
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "mode_summary_prompt"))
 
-async def handle_qstyle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def level_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
     if len(parts) != 3:
         return
-    _, setup_id, style = parts
-    session_setup_id = context.user_data.get("setup_id")
-    has_pending_text = bool(context.user_data.get("pending_text"))
-    if session_setup_id and session_setup_id != setup_id:
-        await query.edit_message_text(t("stale_button", get_lang(context.user_data)))
+    _, setup_id, level = parts
+    pending = context.user_data.get("pending_file")
+    if not pending or pending.get("setup_id") != setup_id:
+        await query.edit_message_text(t(context.user_data, "stale"))
         return
-    if not has_pending_text:
-        await query.edit_message_reply_markup()
+    if level not in LEVEL_LIMITS:
         return
-    if style not in ("basic", "cases", "challenging"):
-        return
-    context.user_data["selected_style"] = style
-    context.user_data["pending_style"] = style
-    context.user_data["pending_difficulty"] = {"basic": "easy", "cases": "medium", "challenging": "hard"}[style]
-    await query.edit_message_text(
-        "كم عدد الأسئلة؟ / How many questions?",
-        reply_markup=build_count_keyboard(),
-    )
+    pending["level"] = level
+    if level == "basic":
+        await query.edit_message_text(t(context.user_data, "basic_count_prompt"), reply_markup=basic_count_keyboard(setup_id))
+    else:
+        await query.edit_message_text(t(context.user_data, "generating_pool"))
+        count = LEVEL_LIMITS[level]
+        await start_quiz_from_bank(update, context, setup_id, level, count)
 
-async def handle_difficulty_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def count_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
     if len(parts) != 3:
         return
-    _, setup_id, difficulty = parts
-    lang = get_lang(context.user_data)
-    session_setup_id = context.user_data.get("setup_id")
-    has_pending_text = bool(context.user_data.get("pending_text"))
-    if session_setup_id and session_setup_id != setup_id:
-        await query.edit_message_text(t("stale_button", lang))
-        return
-    if not has_pending_text:
-        await query.edit_message_reply_markup()
-        return
-    if difficulty not in ("easy", "medium", "hard", "nightmare"):
-        return
-    context.user_data["pending_difficulty"] = difficulty
-    await query.edit_message_text(
-        t("diff_selected", lang, diff=diff_label(difficulty, lang)),
-        parse_mode="Markdown",
-        reply_markup=build_count_keyboard(),
-    )
-
-async def handle_count_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split(":")
-    if len(parts) != 2:
-        return
+    _, setup_id, count_s = parts
     try:
-        count = int(parts[1])
+        count = int(count_s)
     except ValueError:
         return
-    if count not in (5, 10, 20, 35, 50):
+    if count not in BASIC_COUNTS:
         return
-    lang = get_lang(context.user_data)
-    text = context.user_data.get("pending_text")
-    difficulty = context.user_data.get("pending_difficulty")
-    style = context.user_data.get("pending_style")
-    if not text or not difficulty:
-        await query.edit_message_text(t("stale_button", lang))
+    pending = context.user_data.get("pending_file")
+    if not pending or pending.get("setup_id") != setup_id:
+        await query.edit_message_text(t(context.user_data, "stale"))
         return
-    await query.edit_message_text(
-        t("generating", lang, count=count, diff=diff_label(difficulty, lang)),
-        parse_mode="Markdown",
-    )
+    await query.edit_message_text(t(context.user_data, "generating_pool"))
+    await start_quiz_from_bank(update, context, setup_id, "basic", count)
+
+
+async def start_quiz_from_bank(update: Update, context: ContextTypes.DEFAULT_TYPE, setup_id: str, level: str, requested_count: int):
+    query = update.callback_query
+    pending = context.user_data.get("pending_file")
+    if not pending or pending.get("setup_id") != setup_id:
+        await query.edit_message_text(t(context.user_data, "stale"))
+        return
     try:
-        file_md5 = context.user_data.get("file_md5")
-        cache_key = (file_md5, "quiz", difficulty, count, style) if file_md5 else None
-        questions = _cache_get(cache_key) if cache_key else None
-        if questions is None:
-            questions = await generate_mcqs(text, count, difficulty, style)
-            if cache_key and questions:
-                _cache_put(cache_key, questions)
+        questions = await get_or_create_question_bank(pending["file_hash"], pending["text"], level)
         if not questions:
-            await query.edit_message_text(t("no_questions", lang), reply_markup=build_count_keyboard())
+            await query.edit_message_text(t(context.user_data, "no_questions"))
             return
+        pool = [shuffle_options(q) for q in questions]
+        random.shuffle(pool)
+        selected = pool[:min(requested_count, len(pool))]
+        if len(selected) < requested_count:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=t(context.user_data, "not_enough", n=len(selected)),
+            )
         quiz_id = str(uuid.uuid4())[:8]
         context.user_data["session"] = {
             "quiz_id": quiz_id,
-            "questions": questions,
+            "questions": selected,
             "current": 0,
             "score": 0,
-            "difficulty": difficulty,
-            "wrong_answers": [],
+            "wrong": [],
+            "level": level,
         }
-        await query.edit_message_text(
-            t("ready", lang, count=len(questions), diff=diff_label(difficulty, lang)),
-            parse_mode="Markdown",
-        )
-        await _send_question(update.effective_chat.id, context.user_data, context.bot)
-        for k in ("pending_text", "pending_difficulty", "pending_style", "selected_style", "pending_count", "setup_id"):
-            context.user_data.pop(k, None)
+        context.user_data.pop("pending_file", None)
+        await query.edit_message_text(t(context.user_data, "quiz_ready", n=len(selected)))
+        await send_current_question(update.effective_chat.id, context)
     except Exception as e:
-        logger.exception("MCQ generation error")
-        await query.edit_message_text(t("mcq_error", lang, err=str(e)), reply_markup=build_count_keyboard())
+        logger.exception("quiz start failed")
+        await query.edit_message_text(t(context.user_data, "error", err=str(e)))
 
-async def handle_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":")[1]
-    lang = get_lang(context.user_data)
-    chat_id = update.effective_chat.id
-    if action == "start":
-        pool = context.user_data.get("review_pool", [])
-        if not pool:
-            await query.edit_message_text(t("review_no_wrong_inline", lang))
-            return
-        context.user_data["review"] = {"pool": pool, "current": 0}
-        await query.edit_message_reply_markup()
-        await send_review_question(chat_id, context)
-    elif action == "next":
-        review = context.user_data.get("review")
-        if not review:
-            await query.edit_message_text(t("review_no_active", lang))
-            return
-        review["current"] += 1
-        await query.edit_message_reply_markup()
-        await send_review_question(chat_id, context)
-    elif action == "exit":
-        context.user_data.pop("review", None)
-        await query.edit_message_reply_markup()
-        await context.bot.send_message(chat_id=chat_id, text=t("review_ended", lang))
-    elif action == "stats":
-        text = format_stats_text(context.user_data)
-        await query.edit_message_reply_markup()
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=build_stats_keyboard(lang))
-    elif action == "new":
-        await query.edit_message_reply_markup()
-        await context.bot.send_message(chat_id=chat_id, text=t("send_pdf_hint", lang))
 
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
     if len(parts) != 4:
         return
-    _, cb_quiz_id, cb_idx_str, chosen = parts
+    _, quiz_id, idx_s, chosen = parts
     try:
-        cb_idx = int(cb_idx_str)
+        idx = int(idx_s)
     except ValueError:
         return
-    chat_id = update.effective_chat.id
-    lang = get_lang(context.user_data)
     session = context.user_data.get("session")
-    if not session or session.get("quiz_id") != cb_quiz_id or session.get("current") != cb_idx:
-        await query.edit_message_reply_markup()
+    if not session or session.get("quiz_id") != quiz_id or session.get("current") != idx:
+        await query.edit_message_reply_markup(reply_markup=None)
         return
     questions = session["questions"]
-    idx = session["current"]
     q = questions[idx]
-    correct = q["correct"].upper()
+    correct = q["correct"]
     opts = q["options"]
-    is_correct = (chosen == correct)
+    is_correct = chosen == correct
     if is_correct:
         session["score"] += 1
-        result_line = t("correct", lang)
+        result = t(context.user_data, "correct")
     else:
-        result_line = t("wrong", lang, chosen=chosen)
-        session.setdefault("wrong_answers", []).append({"question": q, "chosen": chosen})
-    session["current"] += 1
-    next_idx = session["current"]
+        result = t(context.user_data, "wrong", chosen=chosen)
+        session["wrong"].append({"question": q, "chosen": chosen})
     feedback = (
-        f"{result_line}\n"
-        f"{t('answer_label', lang)} *{correct}.* {escape_md(opts.get(correct, correct))}\n\n"
-        f"{t('explanation', lang)} {escape_md(q.get('explanation', ''))}"
+        format_question(q, idx + 1, len(questions), context.user_data) + "\n\n" +
+        f"{escape_md(result)}\n" +
+        f"{t(context.user_data, 'answer')} {correct}. {escape_md(opts.get(correct, ''))}\n\n" +
+        f"{t(context.user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
     )
-    original_text = format_question(q, idx+1, len(questions), session["difficulty"], lang)
-    full_text = original_text + "\n\n" + feedback
     try:
-        await query.edit_message_text(text=full_text, parse_mode="Markdown", reply_markup=None)
+        await query.edit_message_text(feedback, parse_mode="Markdown")
     except Exception:
-        await query.edit_message_reply_markup()
-        plain_head = t("plain_correct", lang) if is_correct else t("plain_wrong", lang, chosen=chosen)
-        plain = f"{plain_head}\n\n{t('plain_correct_line', lang, letter=correct, opt=opts.get(correct, correct))}\n\n{t('plain_explanation', lang, text=q.get('explanation', ''))}"
-        await _safe_send(context.bot, chat_id, plain)
-    await asyncio.sleep(0.5)
-    if next_idx >= len(questions):
-        await _send_final_score(chat_id, context.user_data, context.bot)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(update.effective_chat.id, feedback.replace("*", ""))
+    session["current"] += 1
+    await asyncio.sleep(0.4)
+    if session["current"] >= len(questions):
+        await send_final_score(update.effective_chat.id, context)
     else:
-        await _send_question(chat_id, context.user_data, context.bot)
+        await send_current_question(update.effective_chat.id, context)
+
+
+async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, action = query.data.split(":", 1)
+    if action == "start":
+        pool = context.user_data.get("review_pool", [])
+        if not pool:
+            await query.edit_message_text(t(context.user_data, "review_none"))
+            return
+        context.user_data["review"] = {"pool": pool, "current": 0}
+        await query.edit_message_reply_markup(reply_markup=None)
+        await send_review(update.effective_chat.id, context)
+    elif action == "next":
+        review = context.user_data.get("review")
+        if not review:
+            return
+        review["current"] += 1
+        await query.edit_message_reply_markup(reply_markup=None)
+        await send_review(update.effective_chat.id, context)
+    elif action == "exit":
+        context.user_data.pop("review", None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "review_done"))
+    elif action == "stats":
+        await query.edit_message_reply_markup(reply_markup=None)
+        stats = get_stats(context.user_data)
+        total = stats["total"]
+        accuracy = round(stats["correct"] / total * 100) if total else 0
+        await context.bot.send_message(
+            update.effective_chat.id,
+            t(context.user_data,
+              "stats_text",
+              quizzes=stats["quizzes"],
+              correct=stats["correct"],
+              total=total,
+              accuracy=accuracy,
+              best=stats["best"])
+        )
+    elif action == "new":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "choose_mode"), reply_markup=mode_keyboard(context.user_data))
+
+
+async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    review = context.user_data.get("review")
+    if not review:
+        return
+    pool = review["pool"]
+    current = review["current"]
+    if current >= len(pool):
+        context.user_data.pop("review", None)
+        await context.bot.send_message(chat_id, t(context.user_data, "review_done"))
+        return
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=format_review(pool[current], current + 1, len(pool), context.user_data),
+        parse_mode="Markdown",
+        reply_markup=review_keyboard(current, len(pool)),
+    )
+
+
+# =============================================================================
+# FILE HANDLING
+# =============================================================================
+def classify_document(mime: str, name: str) -> Optional[str]:
+    mime = (mime or "").lower()
+    name = (name or "").lower()
+    if mime == "application/pdf" or name.endswith(".pdf"):
+        return "pdf"
+    if mime in ("image/jpeg", "image/jpg", "image/png", "image/webp") or name.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return "image"
+    if "wordprocessingml" in mime or name.endswith(".docx"):
+        return "docx"
+    if mime == "text/plain" or name.endswith(".txt"):
+        return "txt"
+    return None
+
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    lang = get_lang(context.user_data)
-    pending_mode = context.user_data.get("pending_mode", "quiz")
-    # Clear previous state
-    for k in ("session", "setup_id", "pending_text", "pending_difficulty", "pending_style",
-              "selected_style", "pending_count", "review", "review_pool", "detective"):
-        context.user_data.pop(k, None)
-    # Determine file type
-    if message.photo:
-        file_type = "image"
-        tg_file = await message.photo[-1].get_file()
-        raw_bytes = bytes(await tg_file.download_as_bytearray())
-    elif message.document:
-        doc = message.document
-        mime = (doc.mime_type or "").lower()
-        name = (doc.file_name or "").lower()
-        if mime == "application/pdf" or name.endswith(".pdf"):
-            file_type = "pdf"
-        elif mime in ("image/jpeg", "image/jpg") or name.endswith((".jpg", ".jpeg")):
-            file_type = "image"
-        elif mime == "image/png" or name.endswith(".png"):
-            file_type = "image"
-        elif "wordprocessingml" in mime or name.endswith(".docx"):
-            file_type = "docx"
-        elif mime == "text/plain" or name.endswith(".txt"):
-            file_type = "txt"
-        else:
-            await message.reply_text(t("file_unsupported", lang))
-            return
-        tg_file = await doc.get_file()
-        raw_bytes = bytes(await tg_file.download_as_bytearray())
-    else:
-        await message.reply_text(t("file_unsupported", lang))
+    user = update.effective_user
+    if user and await cooldown_guard(update, context.user_data, user.id):
         return
-    msg = await message.reply_text(t("file_received", lang))
+    if context.user_data.get("busy"):
+        await update.message.reply_text(t(context.user_data, "busy"))
+        return
+    context.user_data["busy"] = True
     try:
-        if file_type == "pdf":
-            text = await extract_text_from_pdf_async(raw_bytes)
-        elif file_type == "image":
-            text = await asyncio.to_thread(extract_text_from_image, raw_bytes, "image/jpeg")
-        elif file_type == "docx":
-            text = await asyncio.to_thread(extract_text_from_docx, raw_bytes)
-        else:  # txt
-            text = extract_text_from_txt(raw_bytes)
-        if not text.strip():
-            await msg.edit_text(t("file_no_text", lang))
+        message = update.message
+        mode = context.user_data.get("pending_mode", "quiz")
+        file_name = "photo.jpg"
+        mime_type = "image/jpeg"
+        raw_bytes = b""
+        file_type = ""
+
+        if message.photo:
+            tg_file = await message.photo[-1].get_file()
+            raw_bytes = bytes(await tg_file.download_as_bytearray())
+            file_type = "image"
+            file_name = "telegram_photo.jpg"
+            mime_type = "image/jpeg"
+        elif message.document:
+            doc = message.document
+            file_name = doc.file_name or "file"
+            mime_type = doc.mime_type or "application/octet-stream"
+            if doc.file_size and doc.file_size > MAX_FILE_SIZE_BYTES:
+                await message.reply_text(t(context.user_data, "file_too_large"))
+                return
+            file_type = classify_document(mime_type, file_name) or ""
+            if not file_type:
+                await message.reply_text(t(context.user_data, "file_unsupported"))
+                return
+            tg_file = await doc.get_file()
+            raw_bytes = bytes(await tg_file.download_as_bytearray())
+        else:
+            await message.reply_text(t(context.user_data, "file_unsupported"))
             return
-        context.user_data["file_md5"] = _md5_bytes(raw_bytes)
-        if pending_mode == "summary":
+
+        if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
+            await message.reply_text(t(context.user_data, "file_too_large"))
+            return
+
+        status = await message.reply_text(t(context.user_data, "file_received"))
+        file_hash = sha256_bytes(raw_bytes)
+        cached_file = await db_get_file(file_hash)
+        if cached_file:
+            text = cached_file["extracted_text"]
+            await status.edit_text(t(context.user_data, "cached_file"))
+            await asyncio.sleep(0.4)
+        else:
+            text = await extract_text(file_type, raw_bytes, mime_type)
+            if not text.strip() or len(text.strip()) < 30:
+                await status.edit_text(t(context.user_data, "file_no_text"))
+                return
+            await db_save_file(file_hash, file_name, len(raw_bytes), mime_type, text)
+
+        if mode == "summary":
             style = context.user_data.get("pending_summary_style", "disease")
-            await msg.edit_text(t("summary_generating", lang), parse_mode="Markdown")
-            summary = await generate_summary(text, style)
-            await msg.delete()
-            await message.reply_text(t("summary_header", lang) + summary, parse_mode="Markdown")
-        elif pending_mode == "detective":
-            await msg.edit_text(t("detective_opening", lang), parse_mode="Markdown")
-            opening = await generate_detective_opening(text)
-            context.user_data["detective"] = {
-                "context": text[:8000],
-                "history": [{"role": "assistant", "content": opening}],
-                "round": 0,
-                "max_rounds": DETECTIVE_MAX_ROUNDS,
-                "finished": False,
-                "busy": False,
-            }
-            await msg.delete()
-            await message.reply_text(opening)
-        else:  # quiz mode
-            setup_id = str(uuid.uuid4())[:8]
-            context.user_data["setup_id"] = setup_id
-            context.user_data["pending_text"] = text
-            await msg.edit_text(
-                "كيف تفضل أن يكون نمط الأسئلة؟ / Choose the question style:",
-                reply_markup=build_question_style_keyboard(setup_id),
-            )
-    except Exception as e:
-        logger.exception("File handling error")
-        await msg.edit_text(t("pdf_failed", lang, err=e))
+            await status.edit_text(t(context.user_data, "generating_summary"))
+            summary = await get_or_create_summary(file_hash, text, style)
+            await status.delete()
+            await message.reply_text(t(context.user_data, "summary_header") + summary, parse_mode="Markdown")
+            return
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = get_lang(context.user_data)
-    detective = context.user_data.get("detective")
-    pending_mode = context.user_data.get("pending_mode")
-    if detective and isinstance(detective, dict) and not detective.get("finished"):
-        move = update.message.text.strip()
-        if not move:
-            return
-        if detective.get("busy"):
-            await update.message.reply_text(t("detective_busy", lang))
-            return
-        detective["busy"] = True
-        try:
-            next_round = detective.get("round", 0) + 1
-            history = detective.get("history", [])
-            history.append({"role": "user", "content": move})
-            reply = await generate_detective_turn(
-                detective.get("context", ""), history, next_round, detective.get("max_rounds", 3)
-            )
-            history.append({"role": "assistant", "content": reply})
-            detective["history"] = history
-            detective["round"] = next_round
-            detective["busy"] = False
-            if next_round >= detective.get("max_rounds", 3):
-                detective["finished"] = True
-                context.user_data.pop("detective", None)
-                context.user_data.pop("pending_mode", None)
-                await update.message.reply_text(reply)
-                await update.message.reply_text(t("detective_finished", lang))
-            else:
-                await update.message.reply_text(reply)
-        except Exception as e:
-            logger.exception("Detective turn error")
-            detective["busy"] = False
-            await update.message.reply_text(t("detective_error", lang, err=e))
-        return
-    if pending_mode == "detective" and not detective:
-        topic = update.message.text.strip()
-        if not topic:
-            await update.message.reply_text(t("detective_no_input", lang))
-            return
-        msg = await update.message.reply_text(t("detective_opening", lang), parse_mode="Markdown")
-        opening = await generate_detective_opening(topic)
-        context.user_data["detective"] = {
-            "context": topic[:8000],
-            "history": [{"role": "assistant", "content": opening}],
-            "round": 0,
-            "max_rounds": DETECTIVE_MAX_ROUNDS,
-            "finished": False,
-            "busy": False,
+        setup_id = str(uuid.uuid4())[:8]
+        context.user_data["pending_mode"] = "quiz"
+        context.user_data["pending_file"] = {
+            "setup_id": setup_id,
+            "file_hash": file_hash,
+            "file_name": file_name,
+            "text": text,
         }
-        await msg.delete()
-        await update.message.reply_text(opening)
-        return
+        await status.edit_text(t(context.user_data, "file_ready_quiz"), reply_markup=level_keyboard(setup_id, context.user_data))
+    except Exception as e:
+        logger.exception("file handling failed")
+        await update.message.reply_text(t(context.user_data, "error", err=str(e)))
+    finally:
+        context.user_data["busy"] = False
+
+
+# =============================================================================
+# TEXT HANDLER
+# =============================================================================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("session"):
-        await update.message.reply_text(t("quiz_in_progress", lang))
-    else:
-        await update.message.reply_text(t("send_pdf_hint", lang))
+        await update.message.reply_text(t(context.user_data, "quiz_in_progress"))
+        return
+    await update.message.reply_text(t(context.user_data, "send_file_hint"))
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
-BOT_COMMANDS = [
-    BotCommand("start", "🏠 Start bot & language"),
-    BotCommand("help", "ℹ️ Help & instructions"),
-    BotCommand("stop", "🛑 End current quiz"),
-    BotCommand("stats", "📊 View performance stats"),
-    BotCommand("review", "❌ Review past mistakes"),
-    BotCommand("language", "🌐 Change interface language"),
-    BotCommand("support", "📱 Support development"),
-    BotCommand("testbot", "🔧 Admin: run self-test"),
-]
 
-BOT_COMMANDS_AR = [
-    BotCommand("start", "🏠 البداية واختيار اللغة"),
-    BotCommand("help", "ℹ️ المساعدة والتعليمات"),
-    BotCommand("stop", "🛑 إيقاف الاختبار الحالي"),
-    BotCommand("stats", "📊 عرض إحصائيات الأداء"),
-    BotCommand("review", "❌ مراجعة الأخطاء السابقة"),
-    BotCommand("language", "🌐 تغيير لغة الواجهة"),
-    BotCommand("support", "📱 دعم استمرار البوت"),
-    BotCommand("testbot", "🔧 المشرف: اختبار ذاتي"),
-]
-
-async def post_init(application):
-    # تم نقل تشغيل عمال الطابور إلى هنا
-    _start_queue_workers(count=5)
-    await application.bot.set_my_commands(BOT_COMMANDS)
-    await application.bot.set_my_commands(BOT_COMMANDS_AR, language_code="ar")
-    logger.info("Bot ready with Groq (llama-3.3-70b-versatile) + Gemini, Queue, Pickle persistence")
-
+# =============================================================================
+# ERROR HANDLER
+# =============================================================================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled exception", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
-        lang = "en"
         try:
-            if context.user_data:
-                lang = get_lang(context.user_data)
+            await update.effective_message.reply_text(t(context.user_data or {}, "error", err=str(context.error)))
         except Exception:
             pass
-        await update.effective_message.reply_text(t("unhandled_error", lang))
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+BOT_COMMANDS = [
+    BotCommand("start", "Start bot"),
+    BotCommand("help", "Help"),
+    BotCommand("stop", "Stop active quiz"),
+    BotCommand("stats", "Show stats"),
+    BotCommand("review", "Review mistakes"),
+    BotCommand("language", "Change language"),
+    BotCommand("testbot", "Admin Gemini test"),
+]
+
+
+async def post_init(application):
+    init_db()
+    await application.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("Bot ready. Model=%s DB=%s MaxFile=%sMB MaxTextChars=%s",
+                GEMINI_MODEL_NAME, DATABASE_PATH, MAX_FILE_SIZE_BYTES // 1024 // 1024, MAX_TEXT_CHARS_FOR_AI)
+
 
 def main():
-    # تم حذف السطر _start_queue_workers(count=5) من هنا
-    persistence = PicklePersistence(filepath="bot_data.pkl")
-    app = ApplicationBuilder().token(TOKEN).persistence(persistence).concurrent_updates(True).post_init(post_init).build()
+    persistence = PicklePersistence(filepath="bot_user_data.pkl")
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .persistence(persistence)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
+
     app.add_error_handler(error_handler)
-    # Command handlers
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("review", review_command))
     app.add_handler(CommandHandler("language", language_command))
-    app.add_handler(CommandHandler("support", support_command))
     app.add_handler(CommandHandler("testbot", testbot_command))
-    # Callback handlers
-    app.add_handler(CallbackQueryHandler(handle_setlang_callback, pattern=r"^setlang:"))
-    app.add_handler(CallbackQueryHandler(handle_lang_callback, pattern=r"^lang:"))
-    app.add_handler(CallbackQueryHandler(handle_mode_callback, pattern=r"^mode:"))
-    app.add_handler(CallbackQueryHandler(handle_setup_back_callback, pattern=r"^setup:back$"))
-    app.add_handler(CallbackQueryHandler(handle_summary_style_callback, pattern=r"^style:"))
-    app.add_handler(CallbackQueryHandler(handle_qstyle_selection, pattern=r"^qstyle:"))
-    app.add_handler(CallbackQueryHandler(handle_difficulty_selection, pattern=r"^difficulty:"))
-    app.add_handler(CallbackQueryHandler(handle_count_selection, pattern=r"^count:"))
-    app.add_handler(CallbackQueryHandler(button_click, pattern=r"^support_madar$"))
-    app.add_handler(CallbackQueryHandler(handle_answer, pattern=r"^answer:"))
-    app.add_handler(CallbackQueryHandler(handle_review_callback, pattern=r"^rv:"))
-    # Message handlers
+
+    app.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang:"))
+    app.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(summary_style_callback, pattern=r"^style:"))
+    app.add_handler(CallbackQueryHandler(level_callback, pattern=r"^level:"))
+    app.add_handler(CallbackQueryHandler(count_callback, pattern=r"^count:"))
+    app.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^ans:"))
+    app.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
+
     class SupportedFileFilter(filters.MessageFilter):
         def filter(self, message):
+            if message.photo:
+                return True
             doc = message.document
             if not doc:
                 return False
-            mime = (doc.mime_type or "").lower()
-            name = (doc.file_name or "").lower()
-            return (mime in ("application/pdf", "image/jpeg", "image/jpg", "image/png",
-                             "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain") or
-                    name.endswith((".pdf", ".jpg", ".jpeg", ".png", ".docx", ".txt")))
+            return classify_document(doc.mime_type or "", doc.file_name or "") is not None
+
     app.add_handler(MessageHandler(filters.PHOTO, handle_file))
     app.add_handler(MessageHandler(SupportedFileFilter(), handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Starting bot with Groq (llama-3.3-70b-versatile) + Gemini, queue system, and enhanced accuracy.")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("Starting bot polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
