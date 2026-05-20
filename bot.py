@@ -140,7 +140,6 @@ SAMPLE_MEDICAL_TEXT = (
 
 # ----------------------------------------------------------------------
 # INTERNATIONALISATION (UI translations) - simplified for brevity
-# (Full translations as in previous version, but we include essential keys)
 # ----------------------------------------------------------------------
 SUPPORTED_LANGS = ("en", "ar")
 TRANSLATIONS = {
@@ -355,7 +354,7 @@ async def _call_ai_with_fallback(system_prompt: str, user_prompt: str, temperatu
             try:
                 response = await asyncio.to_thread(
                     groq_client.chat.completions.create,
-                    model="llama-3.3-70b-versatile",  # <--- التعديل المطلوب
+                    model="llama-3.3-70b-versatile",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
@@ -1487,6 +1486,8 @@ BOT_COMMANDS_AR = [
 ]
 
 async def post_init(application):
+    # تم نقل تشغيل عمال الطابور إلى هنا
+    _start_queue_workers(count=5)
     await application.bot.set_my_commands(BOT_COMMANDS)
     await application.bot.set_my_commands(BOT_COMMANDS_AR, language_code="ar")
     logger.info("Bot ready with Groq (llama-3.3-70b-versatile) + Gemini, Queue, Pickle persistence")
@@ -1503,7 +1504,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(t("unhandled_error", lang))
 
 def main():
-    _start_queue_workers(count=5)
+    # تم حذف السطر _start_queue_workers(count=5) من هنا
     persistence = PicklePersistence(filepath="bot_data.pkl")
     app = ApplicationBuilder().token(TOKEN).persistence(persistence).concurrent_updates(True).post_init(post_init).build()
     app.add_error_handler(error_handler)
