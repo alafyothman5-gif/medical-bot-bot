@@ -1,0 +1,5 @@
+openai>=2.37.0
+psycopg2-binary>=2.9.12
+pymupdf>=1.27.2.3
+pypdf>=6.11.0
+python-telegram-bot>=22.7
