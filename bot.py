@@ -8,6 +8,8 @@ Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
 - Improved JSON extraction, plain summary, exact question count prompt
 - Summary max_output_tokens raised to 8192 (fix Disease/OSCE blank)
 - Disease key disease_v2, summary empty check & error feedback
+- File-based persistence for /workspace
+- Concurrent generation locks to prevent duplicate API calls
 """
 
 import asyncio
@@ -60,7 +62,10 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY environment variable not set")
 GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "google/gemini-2.5-flash-lite")
-DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_cache.sqlite3")
+DATABASE_PATH = os.environ.get(
+    "DATABASE_PATH",
+    "/workspace/bot_cache.sqlite3"
+)
 MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
 MAX_TEXT_CHARS_FOR_AI = 20000
 MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "2"))
@@ -70,6 +75,15 @@ ADMIN_USER_IDS = {1692255414}
 ADMIN_LOG_CHAT_ID = int(os.environ.get("ADMIN_LOG_CHAT_ID", "-1003987051773"))
 
 _GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
+
+# Generation locks to prevent duplicate expensive API calls
+_generation_locks: Dict[str, asyncio.Lock] = {}
+
+def get_generation_lock(key: str) -> asyncio.Lock:
+    if key not in _generation_locks:
+        _generation_locks[key] = asyncio.Lock()
+    return _generation_locks[key]
+
 
 # =============================================================================
 # TRANSLATIONS
@@ -649,30 +663,56 @@ async def generate_question_bank(text: str, level: str) -> List[dict]:
 
 
 async def get_or_create_question_bank(file_hash: str, text: str, level: str) -> List[dict]:
-    cached = await db_get_questions(file_hash, level)
-    if cached is not None:
-        return cached
-    questions = await generate_question_bank(text, level)
-    if questions:
-        await db_save_questions(file_hash, level, questions)
-    return questions
+    """Return cached questions or generate them under a lock to avoid duplicate API calls."""
+    lock = get_generation_lock(f"questions:{file_hash}:{level}")
+
+    async with lock:
+        cached = await db_get_questions(file_hash, level)
+
+        if cached is not None:
+            return cached
+
+        questions = await generate_question_bank(text, level)
+
+        if questions:
+            await db_save_questions(file_hash, level, questions)
+
+        return questions
 
 
 async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
-    cached = await db_get_summary(file_hash, style)
-    if cached:
-        return cached
-    source = text[:MAX_TEXT_CHARS_FOR_AI]
-    prompt = f"{SUMMARY_PROMPTS.get(style, SUMMARY_PROMPTS['disease_v2'])}\nSOURCE:\n{source}"
-    try:
-        # زيادة max_output_tokens للملخصات إلى 8192 لتجنب القطع (حل مشكلة Disease/OSCE الفارغة)
-        summary = await call_gemini(prompt, temperature=0.2, max_output_tokens=8192)
-    except Exception as e:
-        logger.error(f"Summary generation error for style {style}: {e}")
-        return ""
-    if summary:
-        await db_save_summary(file_hash, style, summary)
-    return summary
+    """Return cached summary or generate it under a lock, with increased token limit."""
+    lock = get_generation_lock(f"summary:{file_hash}:{style}")
+
+    async with lock:
+        cached = await db_get_summary(file_hash, style)
+
+        if cached:
+            return cached
+
+        source = text[:MAX_TEXT_CHARS_FOR_AI]
+
+        prompt = (
+            f"{SUMMARY_PROMPTS.get(style, SUMMARY_PROMPTS['disease_v2'])}"
+            f"\nSOURCE:\n{source}"
+        )
+
+        try:
+            summary = await call_gemini(
+                prompt,
+                temperature=0.2,
+                max_output_tokens=8192
+            )
+        except Exception as e:
+            logger.error(
+                f"Summary generation error for style {style}: {e}"
+            )
+            return ""
+
+        if summary and summary.strip():
+            await db_save_summary(file_hash, style, summary)
+
+        return summary
 
 
 # =============================================================================
@@ -1281,7 +1321,9 @@ async def post_init(application: Application):
     )
 
 def main():
-    persistence = PicklePersistence(filepath="bot_user_data.pkl")
+    persistence = PicklePersistence(
+        filepath="/workspace/bot_user_data.pkl"
+    )
     application = (
         ApplicationBuilder()
         .token(TOKEN)
