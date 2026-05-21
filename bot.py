@@ -10,7 +10,7 @@ Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
 - Disease key disease_v2, summary empty check & error feedback
 - File-based persistence for /workspace
 - Concurrent generation locks to prevent duplicate API calls
-- Fixed: Medical safety filters, 4-option MCQs, long summary chunking, and hard tier prompts
+- Fixed: Medical safety filters, 4-option MCQs, long summary chunking, hard tier prompts, and answer/review chunking
 """
 
 import asyncio
@@ -1042,12 +1042,22 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         result = t(context.user_data, "wrong", chosen=chosen)
         session["wrong"].append({"question": q, "chosen": chosen})
+        
     feedback = format_question(q, idx+1, len(questions), context.user_data) + "\n\n" + f"{escape_md(result)}\n{t(context.user_data, 'answer')} {correct}. {escape_md(opts.get(correct, ''))}\n\n{t(context.user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
+    
+    # تقسيم النص إذا تجاوز 4000 حرف لتجنب خطأ تيليجرام
+    chunks = [feedback[i:i+4000] for i in range(0, len(feedback), 4000)]
+    
     try:
-        await query.edit_message_text(feedback, parse_mode="Markdown")
+        await query.edit_message_text(chunks[0], parse_mode="Markdown")
     except:
         await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(update.effective_chat.id, feedback.replace("*", ""))
+        await context.bot.send_message(update.effective_chat.id, chunks[0].replace("*", ""))
+        
+    # إرسال باقي الأجزاء إن وجدت
+    for chunk in chunks[1:]:
+        await context.bot.send_message(update.effective_chat.id, chunk.replace("*", ""))
+
     session["current"] += 1
     await asyncio.sleep(0.4)
     if session["current"] >= len(questions):
@@ -1096,7 +1106,23 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("review", None)
         await context.bot.send_message(chat_id, t(context.user_data, "review_done"))
         return
-    await context.bot.send_message(chat_id=chat_id, text=format_review(pool[current], current+1, len(pool), context.user_data), parse_mode="Markdown", reply_markup=review_keyboard(current, len(pool)))
+        
+    text = format_review(pool[current], current+1, len(pool), context.user_data)
+    
+    # تقسيم نص المراجعة لتجاوز الحد المسموح
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    
+    for i, chunk in enumerate(chunks):
+        try:
+            if i == len(chunks) - 1:
+                await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown", reply_markup=review_keyboard(current, len(pool)))
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
+        except:
+            if i == len(chunks) - 1:
+                await context.bot.send_message(chat_id=chat_id, text=chunk.replace("*", ""), reply_markup=review_keyboard(current, len(pool)))
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=chunk.replace("*", ""))
 
 
 # =============================================================================
