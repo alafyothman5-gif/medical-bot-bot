@@ -3,7 +3,9 @@
 
 """
 Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
-Updated: PPTX, chunking, auto‑cleanup, back navigation, admin logs, support system
+- PPTX, chunking, auto-cleanup, back navigation, admin logs
+- Daily usage limits (Basic 3, Cases 2, Challenge 1, Summary 3)
+- Improved JSON extraction, plain summary, exact question count prompt
 """
 
 import asyncio
@@ -17,7 +19,6 @@ import re
 import sqlite3
 import time
 import uuid
-import base64
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
@@ -59,7 +60,7 @@ if not OPENROUTER_API_KEY:
 GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "google/gemini-2.5-flash-lite")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_cache.sqlite3")
 MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
-MAX_TEXT_CHARS_FOR_AI = 40000
+MAX_TEXT_CHARS_FOR_AI = 20000          # تم التخفيض
 MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "2"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 
@@ -69,7 +70,7 @@ ADMIN_LOG_CHAT_ID = int(os.environ.get("ADMIN_LOG_CHAT_ID", "-1003987051773"))
 _GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
 
 # =============================================================================
-# TRANSLATIONS (مختصرة لكنها كاملة في التشغيل)
+# TRANSLATIONS
 # =============================================================================
 SUPPORTED_LANGS = ("en", "ar")
 
@@ -391,6 +392,67 @@ def update_stats(user_data: dict, score: int, total: int) -> None:
     if pct > stats["best"]:
         stats["best"] = pct
 
+# =============================================================================
+# DAILY USAGE LIMITS
+# =============================================================================
+def today_key() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def usage_get(user_data: dict) -> dict:
+    day = today_key()
+    usage = user_data.get("daily_usage")
+
+    if not usage or usage.get("day") != day:
+        usage = {
+            "day": day,
+            "basic": 0,
+            "cases": 0,
+            "challenge": 0,
+            "summary": 0,
+        }
+        user_data["daily_usage"] = usage
+
+    return usage
+
+def usage_limit_for(kind: str) -> int:
+    limits = {
+        "basic": 3,
+        "cases": 2,
+        "challenge": 1,
+        "summary": 3,
+    }
+    return limits.get(kind, 0)
+
+def is_admin_user(user_id: Optional[int]) -> bool:
+    return bool(user_id and user_id in ADMIN_USER_IDS)
+
+async def check_daily_limit(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> bool:
+    user = update.effective_user
+
+    if is_admin_user(user.id if user else None):
+        return True
+
+    usage = usage_get(context.user_data)
+    limit = usage_limit_for(kind)
+
+    if usage.get(kind, 0) >= limit:
+        await update.effective_message.reply_text(
+            f"⚠️ وصلت للحد اليومي لهذا النوع.\n\n"
+            f"الحد اليومي:\n"
+            f"Basic: 3\n"
+            f"Cases: 2\n"
+            f"Challenge: 1\n"
+            f"Summary: 3\n\n"
+            f"يرجع العداد غداً."
+        )
+        return False
+
+    return True
+
+def increment_daily_usage(user_data: dict, kind: str) -> None:
+    usage = usage_get(user_data)
+    usage[kind] = usage.get(kind, 0) + 1
+
 
 # =============================================================================
 # OPENROUTER API
@@ -465,7 +527,7 @@ def extract_text(file_type: str, raw_bytes: bytes) -> str:
 
 
 # =============================================================================
-# PROMPTS و GENERATION (chunked)
+# PROMPTS & GENERATION
 # =============================================================================
 LEVEL_LIMITS = {"basic": 50, "cases": 5, "challenge": 2}
 BASIC_COUNTS = (5, 10, 20, 30, 40)
@@ -490,19 +552,29 @@ SUMMARY_PROMPTS = {
     "osce": "OSCE-style approach: History, Examination, Investigations, Management, Counseling, Red Flags.",
 }
 
+
 def extract_json_array(raw: str) -> Optional[list]:
+    """Improved JSON extraction: strips markdown code fences, uses correct regex."""
     raw = (raw or "").strip()
+
     try:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, list) else None
-    except:
-        match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except:
-                pass
+    except Exception:
+        pass
+
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, list) else None
+        except Exception:
+            return None
+
     return None
+
 
 def normalize_questions(items: list) -> List[dict]:
     clean = []
@@ -546,16 +618,31 @@ def shuffle_options(q: dict) -> dict:
 def split_text(text: str, chunk_size: int = 10000) -> List[str]:
     return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
+
 async def generate_question_bank(text: str, level: str) -> List[dict]:
     chunks = split_text(text, chunk_size=10000)
     all_questions = []
+    target = LEVEL_LIMITS[level]
+
     for chunk in chunks:
-        prompt = f"{LEVEL_PROMPTS[level]}\nSOURCE TEXT:\n{chunk}"
+        prompt = (
+            f"{LEVEL_PROMPTS[level]}\n"
+            f"Generate up to {target} questions only.\n"
+            f"Return JSON array only. No markdown. No explanation outside JSON.\n\n"
+            f"SOURCE TEXT:\n{chunk}"
+        )
+
         raw = await call_gemini(prompt, temperature=0.15, max_output_tokens=8192)
         parsed = extract_json_array(raw)
+
         if parsed:
             all_questions.extend(normalize_questions(parsed))
-    return all_questions[:LEVEL_LIMITS[level]]
+
+        if len(all_questions) >= target:
+            break
+
+    return all_questions[:target]
+
 
 async def get_or_create_question_bank(file_hash: str, text: str, level: str) -> List[dict]:
     cached = await db_get_questions(file_hash, level)
@@ -565,6 +652,7 @@ async def get_or_create_question_bank(file_hash: str, text: str, level: str) -> 
     if questions:
         await db_save_questions(file_hash, level, questions)
     return questions
+
 
 async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
     cached = await db_get_summary(file_hash, style)
@@ -579,7 +667,7 @@ async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
 
 
 # =============================================================================
-# KEYBOARDS (with back buttons)
+# KEYBOARDS
 # =============================================================================
 def lang_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -755,7 +843,7 @@ async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# CALLBACK HANDLERS (quiz, review, etc.)
+# CALLBACK HANDLERS
 # =============================================================================
 async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -799,6 +887,11 @@ async def level_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(t(context.user_data, "stale"))
         return
     if level not in LEVEL_LIMITS: return
+
+    # check daily limit before proceeding (admin exempt)
+    if not await check_daily_limit(update, context, level):
+        return
+
     pending["level"] = level
     if level == "basic":
         await query.edit_message_text(t(context.user_data, "basic_count_prompt"), reply_markup=basic_count_keyboard(setup_id))
@@ -821,6 +914,7 @@ async def count_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending or pending.get("setup_id") != setup_id:
         await query.edit_message_text(t(context.user_data, "stale"))
         return
+    # basic limit already checked in level_callback
     await query.edit_message_text(t(context.user_data, "generating_pool"))
     await start_quiz_from_bank(update, context, setup_id, "basic", count)
 
@@ -845,6 +939,8 @@ async def start_quiz_from_bank(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("pending_file", None)
         await query.edit_message_text(t(context.user_data, "quiz_ready", n=len(selected)))
         await send_current_question(update.effective_chat.id, context)
+        # increment daily usage after successful quiz start
+        increment_daily_usage(context.user_data, level)
     except Exception as e:
         logger.exception("quiz start failed")
         await query.edit_message_text(t(context.user_data, "error", err=str(e)))
@@ -932,7 +1028,7 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# BACK NAVIGATION & SUPPORT CALLBACKS (NEW)
+# BACK NAVIGATION & SUPPORT CALLBACKS
 # =============================================================================
 async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1077,13 +1173,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         mode = context.user_data.get("pending_mode", "quiz")
         if mode == "summary":
+            # check daily limit for summary
+            if not await check_daily_limit(update, context, "summary"):
+                return
+
             style = context.user_data.get("pending_summary_style", "disease")
             await status.edit_text(t(context.user_data, "generating_summary"))
             summary = await get_or_create_summary(file_hash, text, style)
             await status.delete()
-            await update.message.reply_text(t(context.user_data, "summary_header") + summary, parse_mode="Markdown")
+            await update.message.reply_text(
+                t(context.user_data, "summary_header") + summary
+            )
+            # increment daily usage after successful summary
+            increment_daily_usage(context.user_data, "summary")
             return
 
+        # quiz mode: file ready, show levels
         setup_id = str(uuid.uuid4())[:8]
         context.user_data["pending_mode"] = "quiz"
         context.user_data["pending_file"] = {
