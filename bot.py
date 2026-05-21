@@ -596,8 +596,8 @@ def extract_json_array(raw: str) -> Optional[list]:
     except Exception:
         pass
 
-    raw = raw.replace("```json", "").replace("
-```", "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+
 
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if match:
