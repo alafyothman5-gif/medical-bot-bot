@@ -77,7 +77,7 @@ TRANSLATIONS = {
     "en": {
         "choose_lang": "🌐 Choose your language\nاختر لغتك",
         "welcome": "Welcome to your Smart Medical Assistant 🩺\n\nSend a medical PDF, image, DOCX, or TXT file.",
-        "help": "Send a medical file up to 30MB. Choose Quiz or Summary. Commands: /start /stop /stats /review /language",
+        "help": "Send a medical file up to 30MB. Choose Quiz or Summary. Commands: /start /stop /stats /review /language /support",
         "choose_mode": "📂 Choose mode:",
         "mode_quiz": "📝 Quiz",
         "mode_summary": "📚 Summary",
@@ -128,7 +128,7 @@ TRANSLATIONS = {
     "ar": {
         "choose_lang": "🌐 اختر لغتك",
         "welcome": "مرحباً بك في المساعد الطبي الذكي 🩺\n\nأرسل ملف PDF أو صورة أو DOCX أو TXT.",
-        "help": "أرسل ملفاً طبياً حتى 30MB. اختر اختبار أو ملخص. الأوامر: /start /stop /stats /review /language",
+        "help": "أرسل ملفاً طبياً حتى 30MB. اختر اختبار أو ملخص. الأوامر: /start /stop /stats /review /language /support",
         "choose_mode": "📂 اختر الوضع:",
         "mode_quiz": "📝 اختبار",
         "mode_summary": "📚 ملخص",
@@ -194,7 +194,7 @@ def t(user_data: dict, key: str, **kwargs) -> str:
 
 
 # =============================================================================
-# SQLITE CACHE
+# SQLITE CACHE (نفس الكود السابق)
 # =============================================================================
 _db_lock = asyncio.Lock()
 
@@ -698,6 +698,15 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["review"] = {"pool": pool, "current": 0}
     await send_review(update.effective_chat.id, context)
 
+async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إظهار معلومات الدعم (رقم الهاتف ومعرف التليجرام)"""
+    message = (
+        "📞 **رقم الدعم**: 0918874659\n\n"
+        "💬 **تيليجرام**: @Othma2003\n\n"
+        "🕒 متاحون للإجابة عن استفساراتكم."
+    )
+    await update.message.reply_text(message, parse_mode="Markdown")
+
 async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id not in ADMIN_USER_IDS:
@@ -992,6 +1001,7 @@ BOT_COMMANDS = [
     BotCommand("stats", "Show stats"),
     BotCommand("review", "Review mistakes"),
     BotCommand("language", "Change language"),
+    BotCommand("support", "الدعم"),   # أمر الدعم الجديد
     BotCommand("testbot", "Admin test"),
 ]
 
@@ -1018,6 +1028,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("review", review_command))
     application.add_handler(CommandHandler("language", language_command))
+    application.add_handler(CommandHandler("support", support_command))  # إضافة معالج الدعم
     application.add_handler(CommandHandler("testbot", testbot_command))
     application.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang:"))
     application.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
