@@ -6,6 +6,7 @@ Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
 - PPTX, chunking, auto-cleanup, back navigation, admin logs
 - Daily usage limits (Basic 3, Cases 2, Challenge 1, Summary 3)
 - Improved JSON extraction, plain summary, exact question count prompt
+- Disease key changed to disease_v2 to avoid cache conflict
 """
 
 import asyncio
@@ -60,7 +61,7 @@ if not OPENROUTER_API_KEY:
 GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "google/gemini-2.5-flash-lite")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_cache.sqlite3")
 MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
-MAX_TEXT_CHARS_FOR_AI = 20000          # تم التخفيض
+MAX_TEXT_CHARS_FOR_AI = 20000
 MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "2"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 
@@ -546,8 +547,9 @@ LEVEL_PROMPTS = {
     "challenge": f"CHALLENGE MCQs. Two-step reasoning. {QUESTION_SCHEMA}",
 }
 
+# Updated: disease key renamed to disease_v2
 SUMMARY_PROMPTS = {
-    "disease": "High-yield medical summary with headings: Overview, Etiology, Clinical, Diagnosis, Management, Complications, Pearls.",
+    "disease_v2": "High-yield medical summary with headings: Overview, Etiology, Clinical, Diagnosis, Management, Complications, Pearls.",
     "highyield": "Concise high-yield notes, bullet points. End with Quick Recall.",
     "osce": "OSCE-style approach: History, Examination, Investigations, Management, Counseling, Red Flags.",
 }
@@ -659,7 +661,8 @@ async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
     if cached:
         return cached
     source = text[:MAX_TEXT_CHARS_FOR_AI]
-    prompt = f"{SUMMARY_PROMPTS.get(style, SUMMARY_PROMPTS['disease'])}\nSOURCE:\n{source}"
+    # Updated default to disease_v2
+    prompt = f"{SUMMARY_PROMPTS.get(style, SUMMARY_PROMPTS['disease_v2'])}\nSOURCE:\n{source}"
     summary = await call_gemini(prompt, temperature=0.2, max_output_tokens=4096)
     if summary:
         await db_save_summary(file_hash, style, summary)
@@ -684,7 +687,8 @@ def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
 
 def summary_style_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(user_data, "style_disease"), callback_data="style:disease")],
+        # Changed callback_data to style:disease_v2
+        [InlineKeyboardButton(t(user_data, "style_disease"), callback_data="style:disease_v2")],
         [InlineKeyboardButton(t(user_data, "style_highyield"), callback_data="style:highyield")],
         [InlineKeyboardButton(t(user_data, "style_osce"), callback_data="style:osce")],
         [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]
@@ -870,6 +874,7 @@ async def summary_style_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     _, style = query.data.split(":", 1)
+    # Now style can be "disease_v2", "highyield", "osce"
     if style not in SUMMARY_PROMPTS: return
     context.user_data["pending_summary_style"] = style
     context.user_data["pending_mode"] = "summary"
@@ -1177,7 +1182,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not await check_daily_limit(update, context, "summary"):
                 return
 
-            style = context.user_data.get("pending_summary_style", "disease")
+            # Updated default to disease_v2
+            style = context.user_data.get("pending_summary_style", "disease_v2")
             await status.edit_text(t(context.user_data, "generating_summary"))
             summary = await get_or_create_summary(file_hash, text, style)
             await status.delete()
