@@ -6,7 +6,8 @@ Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
 - PPTX, chunking, auto-cleanup, back navigation, admin logs
 - Daily usage limits (Basic 3, Cases 2, Challenge 1, Summary 3)
 - Improved JSON extraction, plain summary, exact question count prompt
-- Disease key changed to disease_v2 to avoid cache conflict
+- Summary max_output_tokens raised to 8192 (fix Disease/OSCE blank)
+- Disease key disease_v2, summary empty check & error feedback
 """
 
 import asyncio
@@ -127,6 +128,7 @@ TRANSLATIONS = {
         "send_file_hint": "Send a medical file to start.",
         "stats_text": "📊 Your Statistics\n\nQuizzes: {quizzes}\nCorrect: {correct}/{total}\nAccuracy: {accuracy}%\nBest score: {best}%",
         "error": "⚠️ Error: {err}",
+        "summary_failed": "⚠️ Failed to generate summary. Please try again or use another file.",
     },
     "ar": {
         "choose_lang": "🌐 اختر لغتك",
@@ -179,6 +181,7 @@ TRANSLATIONS = {
         "send_file_hint": "أرسل ملفاً طبياً للبدء.",
         "stats_text": "📊 إحصائياتك\n\nالاختبارات: {quizzes}\nالصحيح: {correct}/{total}\nالدقة: {accuracy}%\nأفضل نتيجة: {best}%",
         "error": "⚠️ خطأ: {err}",
+        "summary_failed": "⚠️ فشل توليد الملخص. حاول مرة أخرى أو استخدم ملفاً آخر.",
     },
 }
 
@@ -547,7 +550,6 @@ LEVEL_PROMPTS = {
     "challenge": f"CHALLENGE MCQs. Two-step reasoning. {QUESTION_SCHEMA}",
 }
 
-# Updated: disease key renamed to disease_v2
 SUMMARY_PROMPTS = {
     "disease_v2": "High-yield medical summary with headings: Overview, Etiology, Clinical, Diagnosis, Management, Complications, Pearls.",
     "highyield": "Concise high-yield notes, bullet points. End with Quick Recall.",
@@ -661,9 +663,13 @@ async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
     if cached:
         return cached
     source = text[:MAX_TEXT_CHARS_FOR_AI]
-    # Updated default to disease_v2
     prompt = f"{SUMMARY_PROMPTS.get(style, SUMMARY_PROMPTS['disease_v2'])}\nSOURCE:\n{source}"
-    summary = await call_gemini(prompt, temperature=0.2, max_output_tokens=4096)
+    try:
+        # زيادة max_output_tokens للملخصات إلى 8192 لتجنب القطع (حل مشكلة Disease/OSCE الفارغة)
+        summary = await call_gemini(prompt, temperature=0.2, max_output_tokens=8192)
+    except Exception as e:
+        logger.error(f"Summary generation error for style {style}: {e}")
+        return ""
     if summary:
         await db_save_summary(file_hash, style, summary)
     return summary
@@ -687,7 +693,6 @@ def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
 
 def summary_style_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        # Changed callback_data to style:disease_v2
         [InlineKeyboardButton(t(user_data, "style_disease"), callback_data="style:disease_v2")],
         [InlineKeyboardButton(t(user_data, "style_highyield"), callback_data="style:highyield")],
         [InlineKeyboardButton(t(user_data, "style_osce"), callback_data="style:osce")],
@@ -874,7 +879,6 @@ async def summary_style_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     _, style = query.data.split(":", 1)
-    # Now style can be "disease_v2", "highyield", "osce"
     if style not in SUMMARY_PROMPTS: return
     context.user_data["pending_summary_style"] = style
     context.user_data["pending_mode"] = "summary"
@@ -893,7 +897,6 @@ async def level_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if level not in LEVEL_LIMITS: return
 
-    # check daily limit before proceeding (admin exempt)
     if not await check_daily_limit(update, context, level):
         return
 
@@ -919,7 +922,6 @@ async def count_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending or pending.get("setup_id") != setup_id:
         await query.edit_message_text(t(context.user_data, "stale"))
         return
-    # basic limit already checked in level_callback
     await query.edit_message_text(t(context.user_data, "generating_pool"))
     await start_quiz_from_bank(update, context, setup_id, "basic", count)
 
@@ -944,7 +946,6 @@ async def start_quiz_from_bank(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("pending_file", None)
         await query.edit_message_text(t(context.user_data, "quiz_ready", n=len(selected)))
         await send_current_question(update.effective_chat.id, context)
-        # increment daily usage after successful quiz start
         increment_daily_usage(context.user_data, level)
     except Exception as e:
         logger.exception("quiz start failed")
@@ -1178,23 +1179,22 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         mode = context.user_data.get("pending_mode", "quiz")
         if mode == "summary":
-            # check daily limit for summary
             if not await check_daily_limit(update, context, "summary"):
                 return
 
-            # Updated default to disease_v2
             style = context.user_data.get("pending_summary_style", "disease_v2")
             await status.edit_text(t(context.user_data, "generating_summary"))
             summary = await get_or_create_summary(file_hash, text, style)
             await status.delete()
-            await update.message.reply_text(
-                t(context.user_data, "summary_header") + summary
-            )
-            # increment daily usage after successful summary
-            increment_daily_usage(context.user_data, "summary")
+            if summary:
+                await update.message.reply_text(
+                    t(context.user_data, "summary_header") + summary
+                )
+                increment_daily_usage(context.user_data, "summary")
+            else:
+                await update.message.reply_text(t(context.user_data, "summary_failed"))
             return
 
-        # quiz mode: file ready, show levels
         setup_id = str(uuid.uuid4())[:8]
         context.user_data["pending_mode"] = "quiz"
         context.user_data["pending_file"] = {
@@ -1309,7 +1309,6 @@ def main():
     application.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
     application.add_handler(CallbackQueryHandler(back_callback, pattern=r"^back:"))
 
-    # Document handler only (no photo)
     application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
