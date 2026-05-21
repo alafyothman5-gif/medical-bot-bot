@@ -2,13 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Smart Medical Assistant Bot - OpenRouter Economical Edition
-
-Changes:
-- Replaced Google Gemini API with OpenRouter API (supports gemini-2.5-flash-lite)
-- Uses urllib.request instead of google.generativeai
-- All other features (cache, quiz levels, summaries, etc.) unchanged
-- Fixed HTTP-Referer header (hyphen instead of underscore)
+Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
+- Uses OpenRouter API with google/gemini-2.0-flash (paid but economical)
+- Persistent SQLite cache, quiz levels, summaries, bilingual (en/ar)
 """
 
 import asyncio
@@ -48,14 +44,14 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("gemini_medical_bot")
+logger = logging.getLogger("medical_bot_openrouter")
 
 # =============================================================================
 # ENVIRONMENT
 # =============================================================================
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "google/gemini-2.5-flash-lite")
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "google/gemini-2.0-flash")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "bot_cache.sqlite3")
 MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
 MAX_TEXT_CHARS_FOR_AI = 40000
@@ -394,17 +390,14 @@ def update_stats(user_data: dict, score: int, total: int) -> None:
 
 
 # =============================================================================
-# OPENROUTER (replaces Gemini) - FIXED HEADER
+# OPENROUTER API (Paid Economical Model)
 # =============================================================================
 async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: int = 4096) -> str:
-    """Send request to OpenRouter API (compatible with Gemini models)."""
     async with _GEMINI_SEMAPHORE:
         def work():
             payload = {
                 "model": GEMINI_MODEL_NAME,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": temperature,
                 "max_tokens": max_output_tokens,
             }
@@ -414,38 +407,35 @@ async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: 
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://telegram.org",   # <--- FIXED: hyphen instead of underscore
+                    "HTTP-Referer": "https://telegram.org",
                     "X-Title": "Medical Telegram Bot",
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=120) as response:
-                data = json.loads(response.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"].strip()
+            try:
+                with urllib.request.urlopen(req, timeout=120) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                    return data["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode('utf-8')
+                logger.error(f"OpenRouter HTTP {e.code}: {error_body}")
+                raise Exception(f"HTTP {e.code}: {error_body[:200]}")
         return await asyncio.to_thread(work)
 
 
 async def extract_text_from_image(image_bytes: bytes, mime_type: str) -> str:
-    """Extract text from image using OpenRouter vision capabilities."""
     async with _GEMINI_SEMAPHORE:
         def work():
             b64 = base64.b64encode(image_bytes).decode("utf-8")
             image_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
-
             payload = {
                 "model": GEMINI_MODEL_NAME,
                 "messages": [
                     {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "text",
-                                "text": "Extract all readable text from this medical image exactly. Do not summarize. Return only raw text."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": image_url}
-                            }
+                            {"type": "text", "text": "Extract all readable text from this medical image exactly. Do not summarize. Return only raw text."},
+                            {"type": "image_url", "image_url": {"url": image_url}}
                         ]
                     }
                 ],
@@ -458,19 +448,24 @@ async def extract_text_from_image(image_bytes: bytes, mime_type: str) -> str:
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://telegram.org",   # <--- FIXED: hyphen instead of underscore
+                    "HTTP-Referer": "https://telegram.org",
                     "X-Title": "Medical Telegram Bot",
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=120) as response:
-                data = json.loads(response.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"].strip()
+            try:
+                with urllib.request.urlopen(req, timeout=120) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                    return data["choices"][0]["message"]["content"].strip()
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode('utf-8')
+                logger.error(f"OpenRouter vision error {e.code}: {error_body}")
+                raise Exception(f"Vision error {e.code}")
         return await asyncio.to_thread(work)
 
 
 # =============================================================================
-# TEXT EXTRACTION (unchanged)
+# TEXT EXTRACTION
 # =============================================================================
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -510,7 +505,7 @@ async def extract_text(file_type: str, raw_bytes: bytes, mime_type: str) -> str:
 
 
 # =============================================================================
-# PROMPTS (unchanged)
+# PROMPTS
 # =============================================================================
 LEVEL_LIMITS = {
     "basic": 50,
@@ -534,7 +529,6 @@ Rules:
 - Do not invent facts outside the source text.
 - English only.
 """
-
 
 LEVEL_PROMPTS = {
     "basic": f"""
@@ -564,7 +558,6 @@ You are a strict medical examiner creating CHALLENGE MCQs. Question style:
 {QUESTION_SCHEMA}
 """,
 }
-
 
 SUMMARY_PROMPTS = {
     "disease": """
@@ -598,24 +591,18 @@ English only.
 
 
 # =============================================================================
-# QUESTION GENERATION + VALIDATION (unchanged)
+# QUESTION GENERATION + VALIDATION
 # =============================================================================
 def extract_json_array(raw: str) -> Optional[list]:
-    """Extract a JSON array safely from AI output."""
     raw = (raw or "").strip()
-
-    # Try direct parse
     try:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, list) else None
     except Exception:
         pass
-
-    # Find first '[' and last ']' using proper regex: \[.*\] with DOTALL
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if not match:
         return None
-
     candidate = match.group(0)
     try:
         parsed = json.loads(candidate)
@@ -723,7 +710,7 @@ SOURCE TEXT:
 
 
 # =============================================================================
-# KEYBOARDS (unchanged)
+# KEYBOARDS
 # =============================================================================
 def lang_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -793,7 +780,7 @@ def review_keyboard(current: int, total: int) -> InlineKeyboardMarkup:
 
 
 # =============================================================================
-# FORMATTING (unchanged)
+# FORMATTING
 # =============================================================================
 def format_question(q: dict, idx: int, total: int, user_data: dict) -> str:
     opts = q.get("options", {})
@@ -829,7 +816,7 @@ def format_review(entry: dict, idx: int, total: int, user_data: dict) -> str:
 
 
 # =============================================================================
-# SENDERS (unchanged)
+# SENDERS
 # =============================================================================
 async def safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
     for attempt in range(2):
@@ -883,7 +870,7 @@ async def send_final_score(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # =============================================================================
-# COMMANDS (unchanged)
+# COMMANDS
 # =============================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
@@ -941,7 +928,7 @@ async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# CALLBACKS (unchanged)
+# CALLBACKS
 # =============================================================================
 async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1174,7 +1161,7 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# FILE HANDLING (unchanged)
+# FILE HANDLING
 # =============================================================================
 def classify_document(mime: str, name: str) -> Optional[str]:
     mime = (mime or "").lower()
@@ -1303,7 +1290,7 @@ BOT_COMMANDS = [
     BotCommand("stats", "Show stats"),
     BotCommand("review", "Review mistakes"),
     BotCommand("language", "Change language"),
-    BotCommand("testbot", "Admin Gemini test"),
+    BotCommand("testbot", "Admin test"),
 ]
 
 
