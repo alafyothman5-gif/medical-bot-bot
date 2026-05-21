@@ -10,6 +10,7 @@ Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
 - Disease key disease_v2, summary empty check & error feedback
 - File-based persistence for /workspace
 - Concurrent generation locks to prevent duplicate API calls
+- Fixed: Medical safety filters, 4-option MCQs, and long summary chunking
 """
 
 import asyncio
@@ -164,7 +165,7 @@ TRANSLATIONS = {
         "file_empty": "⚠️ الملف فارغ أو يحتوي على صور فقط (لا يوجد نص مقروء).",
         "file_ready_quiz": "✅ الملف جاهز. اختر مستوى الأسئلة:",
         "file_ready_summary": "✅ الملف جاهز. جاري تجهيز الملخص...",
-        "cached_file": "♻️ الملف موجود مسبقاً في الكاش. لن نستهلك Gemini من جديد.",
+        "cached_file": "♻️ الملف موجود مسبقاً في الكاش. لن نستهلك الذكاء الاصطناعي من جديد.",
         "level_basic": "🟢 Basic مباشر",
         "level_cases": "🩺 Cases حالات",
         "level_challenge": "🧠 Challenge تحدي",
@@ -496,13 +497,25 @@ async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: 
                 method="POST",
             )
             try:
+                print(f"--> [OpenRouter] Sending request. Tokens: {max_output_tokens}")
                 with urllib.request.urlopen(req, timeout=120) as response:
-                    data = json.loads(response.read().decode("utf-8"))
+                    raw_data = response.read().decode("utf-8")
+                    data = json.loads(raw_data)
+                    
+                    if "choices" not in data:
+                        print(f"❌ [OpenRouter] Error Format Received: {raw_data}")
+                        return ""
+                        
+                    print("<-- [OpenRouter] Response received successfully!")
                     return data["choices"][0]["message"]["content"].strip()
+                    
             except urllib.error.HTTPError as e:
                 error_body = e.read().decode('utf-8')
-                logger.error(f"OpenRouter HTTP {e.code}: {error_body}")
+                print(f"❌ [OpenRouter] HTTP ERROR {e.code}: {error_body}")
                 raise Exception(f"HTTP {e.code}: {error_body[:200]}")
+            except Exception as e:
+                print(f"❌ [OpenRouter] UNKNOWN ERROR: {str(e)}")
+                raise e
         return await asyncio.to_thread(work)
 
 
@@ -558,16 +571,18 @@ QUESTION_SCHEMA = """ Return valid JSON array only. No markdown. Each item must 
 }
 Exactly 5 options A-E. correct is one of A-E. Base only on source text."""
 
+ACADEMIC_PREFIX = "Educational medical simulation. Do not provide real medical advice. "
+
 LEVEL_PROMPTS = {
-    "basic": f"BASIC direct MCQs. No vignettes. {QUESTION_SCHEMA}",
-    "cases": f"CLINICAL CASE MCQs. Short patient scenarios. {QUESTION_SCHEMA}",
-    "challenge": f"CHALLENGE MCQs. Two-step reasoning. {QUESTION_SCHEMA}",
+    "basic": f"{ACADEMIC_PREFIX}BASIC direct MCQs. No vignettes. {QUESTION_SCHEMA}",
+    "cases": f"{ACADEMIC_PREFIX}CLINICAL CASE MCQs. Short patient scenarios. {QUESTION_SCHEMA}",
+    "challenge": f"{ACADEMIC_PREFIX}CHALLENGE MCQs. Two-step reasoning. {QUESTION_SCHEMA}",
 }
 
 SUMMARY_PROMPTS = {
-    "disease_v2": "High-yield medical summary with headings: Overview, Etiology, Clinical, Diagnosis, Management, Complications, Pearls.",
-    "highyield": "Concise high-yield notes, bullet points. End with Quick Recall.",
-    "osce": "OSCE-style approach: History, Examination, Investigations, Management, Counseling, Red Flags.",
+    "disease_v2": f"{ACADEMIC_PREFIX}High-yield medical summary with headings: Overview, Etiology, Clinical, Diagnosis, Management, Complications, Pearls.",
+    "highyield": f"{ACADEMIC_PREFIX}Concise high-yield notes, bullet points. End with Quick Recall.",
+    "osce": f"{ACADEMIC_PREFIX}OSCE-style approach: History, Examination, Investigations, Management, Counseling, Red Flags.",
 }
 
 
@@ -581,7 +596,8 @@ def extract_json_array(raw: str) -> Optional[list]:
     except Exception:
         pass
 
-    raw = raw.replace("```json", "").replace("```", "").strip()
+    raw = raw.replace("```json", "").replace("
+```", "").strip()
 
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if match:
@@ -602,16 +618,27 @@ def normalize_questions(items: list) -> List[dict]:
         options = q.get("options")
         correct = str(q.get("correct", "")).strip().upper()
         explanation = str(q.get("explanation", "")).strip()
-        if not question or not isinstance(options, dict) or correct not in "ABCDE": continue
+        
+        if not question or not isinstance(options, dict) or correct not in ["A", "B", "C", "D", "E"]: continue
+        
         norm_opts = {}
         ok = True
-        for letter in "ABCDE":
+        for letter in ["A", "B", "C", "D"]:
             val = str(options.get(letter, "")).strip()
             if not val:
                 ok = False
                 break
             norm_opts[letter] = val
-        if not ok or correct not in norm_opts: continue
+            
+        if not ok: continue
+        
+        e_val = str(options.get("E", "")).strip()
+        if not e_val:
+            norm_opts["E"] = "None of the above"
+        else:
+            norm_opts["E"] = e_val
+            
+        if correct not in norm_opts: continue
         clean.append({"question": question, "options": norm_opts, "correct": correct, "explanation": explanation or "Based on lecture text."})
     return clean
 
@@ -1124,7 +1151,7 @@ async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "💳 دعم عبر رصيد المدار\n\n"
             "رقم المدار:\n"
-            "`0918874659`\n\n"
+            "0918874659\n\n"
             "بعد إرسال الرصيد، اضغط تواصل مع الدعم واكتب اسمك أو رقم العملية.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -1226,10 +1253,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(t(context.user_data, "generating_summary"))
             summary = await get_or_create_summary(file_hash, text, style)
             await status.delete()
+            
             if summary:
-                await update.message.reply_text(
-                    t(context.user_data, "summary_header") + summary
-                )
+                full_text = t(context.user_data, "summary_header") + summary
+                
+                # تقسيم النص لتجاوز حد رسائل تيليجرام (4096 حرف)
+                chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
+                for chunk in chunks:
+                    await update.message.reply_text(chunk)
+                    
                 increment_daily_usage(context.user_data, "summary")
             else:
                 await update.message.reply_text(t(context.user_data, "summary_failed"))
