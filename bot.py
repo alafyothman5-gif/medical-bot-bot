@@ -3,9 +3,7 @@
 
 """
 Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
-- Uses OpenRouter API with google/gemini-2.5-flash-lite (economical)
-- Persistent SQLite cache, quiz levels, summaries, bilingual (en/ar)
-- Fully compatible with python-telegram-bot v20+
+Updated: PPTX, chunking, auto‑cleanup, back navigation, admin logs, support system
 """
 
 import asyncio
@@ -22,10 +20,11 @@ import uuid
 import base64
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from docx import Document
+from pptx import Presentation
 from pypdf import PdfReader
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -65,18 +64,19 @@ MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "2"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 
 ADMIN_USER_IDS = {1692255414}
+ADMIN_LOG_CHAT_ID = int(os.environ.get("ADMIN_LOG_CHAT_ID", "-1003987051773"))
 
 _GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
 
 # =============================================================================
-# TRANSLATIONS (مختصرة لتوفير المساحة لكنها كاملة في التشغيل)
+# TRANSLATIONS (مختصرة لكنها كاملة في التشغيل)
 # =============================================================================
 SUPPORTED_LANGS = ("en", "ar")
 
 TRANSLATIONS = {
     "en": {
         "choose_lang": "🌐 Choose your language\nاختر لغتك",
-        "welcome": "Welcome to your Smart Medical Assistant 🩺\n\nSend a medical PDF, image, DOCX, or TXT file.",
+        "welcome": "Welcome to your Smart Medical Assistant 🩺\n\nSend a medical PDF, DOCX, PPTX, or TXT file.",
         "help": "Send a medical file up to 30MB. Choose Quiz or Summary. Commands: /start /stop /stats /review /language /support",
         "choose_mode": "📂 Choose mode:",
         "mode_quiz": "📝 Quiz",
@@ -89,8 +89,9 @@ TRANSLATIONS = {
         "style_osce": "📋 OSCE",
         "file_received": "📄 File received — extracting text...",
         "file_too_large": "⚠️ File is larger than 30MB. Please send a smaller file.",
-        "file_unsupported": "⚠️ Unsupported file type. Send PDF, image, DOCX, or TXT.",
+        "file_unsupported": "⚠️ Unsupported file type. Send PDF, DOCX, PPTX, or TXT.",
         "file_no_text": "⚠️ I could not extract readable text from this file.",
+        "file_empty": "⚠️ File is empty or contains only images (no readable text).",
         "file_ready_quiz": "✅ File ready. Choose question level:",
         "file_ready_summary": "✅ File ready. Preparing summary...",
         "cached_file": "♻️ Same file found in cache. No extra AI cost.",
@@ -127,7 +128,7 @@ TRANSLATIONS = {
     },
     "ar": {
         "choose_lang": "🌐 اختر لغتك",
-        "welcome": "مرحباً بك في المساعد الطبي الذكي 🩺\n\nأرسل ملف PDF أو صورة أو DOCX أو TXT.",
+        "welcome": "مرحباً بك في المساعد الطبي الذكي 🩺\n\nأرسل ملف PDF أو DOCX أو PPTX أو TXT.",
         "help": "أرسل ملفاً طبياً حتى 30MB. اختر اختبار أو ملخص. الأوامر: /start /stop /stats /review /language /support",
         "choose_mode": "📂 اختر الوضع:",
         "mode_quiz": "📝 اختبار",
@@ -140,8 +141,9 @@ TRANSLATIONS = {
         "style_osce": "📋 OSCE",
         "file_received": "📄 تم استلام الملف — جاري استخراج النص...",
         "file_too_large": "⚠️ الملف أكبر من 30MB. أرسل ملفاً أصغر.",
-        "file_unsupported": "⚠️ نوع الملف غير مدعوم. أرسل PDF أو صورة أو DOCX أو TXT.",
+        "file_unsupported": "⚠️ نوع الملف غير مدعوم. أرسل PDF, DOCX, PPTX أو TXT فقط.",
         "file_no_text": "⚠️ لم أستطع استخراج نص مقروء من الملف.",
+        "file_empty": "⚠️ الملف فارغ أو يحتوي على صور فقط (لا يوجد نص مقروء).",
         "file_ready_quiz": "✅ الملف جاهز. اختر مستوى الأسئلة:",
         "file_ready_summary": "✅ الملف جاهز. جاري تجهيز الملخص...",
         "cached_file": "♻️ الملف موجود مسبقاً في الكاش. لن نستهلك Gemini من جديد.",
@@ -194,7 +196,7 @@ def t(user_data: dict, key: str, **kwargs) -> str:
 
 
 # =============================================================================
-# SQLITE CACHE (نفس الكود السابق)
+# SQLITE CACHE
 # =============================================================================
 _db_lock = asyncio.Lock()
 
@@ -309,6 +311,42 @@ async def db_save_summary(file_hash: str, style: str, summary: str) -> None:
 
 
 # =============================================================================
+# AUTO CLEANUP
+# =============================================================================
+async def cleanup_old_cache(days: int = 30) -> None:
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            cur = conn.cursor()
+
+            old_files = cur.execute(
+                "SELECT file_hash FROM files WHERE created_at < ?",
+                (cutoff,)
+            ).fetchall()
+
+            old_hashes = [row["file_hash"] for row in old_files]
+
+            for file_hash in old_hashes:
+                cur.execute("DELETE FROM question_banks WHERE file_hash=?", (file_hash,))
+                cur.execute("DELETE FROM summaries WHERE file_hash=?", (file_hash,))
+                cur.execute("DELETE FROM files WHERE file_hash=?", (file_hash,))
+
+            cur.execute("DELETE FROM question_banks WHERE created_at < ?", (cutoff,))
+            cur.execute("DELETE FROM summaries WHERE created_at < ?", (cutoff,))
+
+            conn.commit()
+            conn.close()
+
+            return len(old_hashes)
+
+        deleted = await asyncio.to_thread(work)
+
+    logger.info("Cleanup done. Deleted old files: %s", deleted)
+
+
+# =============================================================================
 # HELPERS
 # =============================================================================
 user_last_request: Dict[int, float] = {}
@@ -387,86 +425,47 @@ async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: 
                 raise Exception(f"HTTP {e.code}: {error_body[:200]}")
         return await asyncio.to_thread(work)
 
-async def extract_text_from_image(image_bytes: bytes, mime_type: str) -> str:
-    async with _GEMINI_SEMAPHORE:
-        def work():
-            b64 = base64.b64encode(image_bytes).decode("utf-8")
-            image_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
-            payload = {
-                "model": GEMINI_MODEL_NAME,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Extract all readable text from this medical image exactly. Do not summarize. Return only raw text."},
-                            {"type": "image_url", "image_url": {"url": image_url}}
-                        ]
-                    }
-                ],
-                "temperature": 0.0,
-                "max_tokens": 4096,
-            }
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://telegram.org",
-                    "X-Title": "Medical Telegram Bot",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=120) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-                    return data["choices"][0]["message"]["content"].strip()
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode('utf-8')
-                logger.error(f"OpenRouter vision error {e.code}: {error_body}")
-                raise Exception(f"Vision error {e.code}")
-        return await asyncio.to_thread(work)
-
 
 # =============================================================================
 # TEXT EXTRACTION
 # =============================================================================
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    pages = []
-    for page in reader.pages:
-        s = page.extract_text()
-        if s:
-            pages.append(s.strip())
-    return "\n\n".join(pages).strip()
+def classify_document(mime: str, name: str) -> str:
+    name = name.lower()
+    if name.endswith('.pdf'):
+        return "pdf"
+    if name.endswith(('.docx', '.doc')):
+        return "docx"
+    if name.endswith(('.pptx', '.ppt')):
+        return "pptx"
+    if name.endswith('.txt'):
+        return "txt"
+    return "unsupported"
 
-def extract_text_from_docx(docx_bytes: bytes) -> str:
-    doc = Document(io.BytesIO(docx_bytes))
-    parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    return "\n\n".join(parts)
-
-def extract_text_from_txt(txt_bytes: bytes) -> str:
-    for enc in ("utf-8", "utf-16", "latin-1"):
-        try:
-            return txt_bytes.decode(enc)
-        except UnicodeDecodeError:
-            pass
-    return txt_bytes.decode("utf-8", errors="replace")
-
-async def extract_text(file_type: str, raw_bytes: bytes, mime_type: str) -> str:
-    if file_type == "pdf":
-        return await asyncio.to_thread(extract_text_from_pdf, raw_bytes)
-    if file_type == "docx":
-        return await asyncio.to_thread(extract_text_from_docx, raw_bytes)
-    if file_type == "txt":
-        return await asyncio.to_thread(extract_text_from_txt, raw_bytes)
-    if file_type == "image":
-        return await extract_text_from_image(raw_bytes, mime_type)
+def extract_text(file_type: str, raw_bytes: bytes) -> str:
+    f = io.BytesIO(raw_bytes)
+    try:
+        if file_type == "pdf":
+            return "\n".join([page.extract_text() for page in PdfReader(f).pages if page.extract_text()])
+        if file_type == "docx":
+            return "\n".join([p.text for p in Document(f).paragraphs if p.text.strip()])
+        if file_type == "pptx":
+            prs = Presentation(f)
+            parts = []
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        parts.append(shape.text)
+            return "\n".join(parts)
+        if file_type == "txt":
+            return raw_bytes.decode('utf-8', errors='ignore')
+    except Exception as e:
+        logger.error(f"Extraction error for {file_type}: {e}")
+        return ""
     return ""
 
 
 # =============================================================================
-# PROMPTS و GENERATION (مختصرة لتوفير المساحة)
+# PROMPTS و GENERATION (chunked)
 # =============================================================================
 LEVEL_LIMITS = {"basic": 50, "cases": 5, "challenge": 2}
 BASIC_COUNTS = (5, 10, 20, 30, 40)
@@ -544,16 +543,19 @@ def shuffle_options(q: dict) -> dict:
     q["correct"] = new_correct
     return q
 
+def split_text(text: str, chunk_size: int = 10000) -> List[str]:
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
 async def generate_question_bank(text: str, level: str) -> List[dict]:
-    limit = LEVEL_LIMITS[level]
-    source = text[:MAX_TEXT_CHARS_FOR_AI]
-    prompt = f"{LEVEL_PROMPTS[level]}\nCreate up to {limit} questions. Only from source.\nSOURCE:\n{source}"
-    raw = await call_gemini(prompt, temperature=0.15, max_output_tokens=8192)
-    parsed = extract_json_array(raw)
-    if parsed is None:
-        logger.warning("Invalid JSON for %s", level)
-        return []
-    return normalize_questions(parsed)[:limit]
+    chunks = split_text(text, chunk_size=10000)
+    all_questions = []
+    for chunk in chunks:
+        prompt = f"{LEVEL_PROMPTS[level]}\nSOURCE TEXT:\n{chunk}"
+        raw = await call_gemini(prompt, temperature=0.15, max_output_tokens=8192)
+        parsed = extract_json_array(raw)
+        if parsed:
+            all_questions.extend(normalize_questions(parsed))
+    return all_questions[:LEVEL_LIMITS[level]]
 
 async def get_or_create_question_bank(file_hash: str, text: str, level: str) -> List[dict]:
     cached = await db_get_questions(file_hash, level)
@@ -577,22 +579,50 @@ async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
 
 
 # =============================================================================
-# KEYBOARDS
+# KEYBOARDS (with back buttons)
 # =============================================================================
 def lang_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🇸🇦 العربية", callback_data="lang:ar"), InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇸🇦 العربية", callback_data="lang:ar"),
+         InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")]
+    ])
 
 def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(t(user_data, "mode_quiz"), callback_data="mode:quiz")], [InlineKeyboardButton(t(user_data, "mode_summary"), callback_data="mode:summary")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(user_data, "mode_quiz"), callback_data="mode:quiz")],
+        [InlineKeyboardButton(t(user_data, "mode_summary"), callback_data="mode:summary")],
+        [InlineKeyboardButton("📞 الدعم", callback_data="back:support")]
+    ])
 
 def summary_style_keyboard(user_data: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(t(user_data, "style_disease"), callback_data="style:disease")], [InlineKeyboardButton(t(user_data, "style_highyield"), callback_data="style:highyield")], [InlineKeyboardButton(t(user_data, "style_osce"), callback_data="style:osce")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(user_data, "style_disease"), callback_data="style:disease")],
+        [InlineKeyboardButton(t(user_data, "style_highyield"), callback_data="style:highyield")],
+        [InlineKeyboardButton(t(user_data, "style_osce"), callback_data="style:osce")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]
+    ])
 
 def level_keyboard(setup_id: str, user_data: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(t(user_data, "level_basic"), callback_data=f"level:{setup_id}:basic")], [InlineKeyboardButton(t(user_data, "level_cases"), callback_data=f"level:{setup_id}:cases")], [InlineKeyboardButton(t(user_data, "level_challenge"), callback_data=f"level:{setup_id}:challenge")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(user_data, "level_basic"), callback_data=f"level:{setup_id}:basic")],
+        [InlineKeyboardButton(t(user_data, "level_cases"), callback_data=f"level:{setup_id}:cases")],
+        [InlineKeyboardButton(t(user_data, "level_challenge"), callback_data=f"level:{setup_id}:challenge")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]
+    ])
 
 def basic_count_keyboard(setup_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("5", callback_data=f"count:{setup_id}:5"), InlineKeyboardButton("10", callback_data=f"count:{setup_id}:10"), InlineKeyboardButton("20", callback_data=f"count:{setup_id}:20")], [InlineKeyboardButton("30", callback_data=f"count:{setup_id}:30"), InlineKeyboardButton("40", callback_data=f"count:{setup_id}:40")]])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5", callback_data=f"count:{setup_id}:5"),
+            InlineKeyboardButton("10", callback_data=f"count:{setup_id}:10"),
+            InlineKeyboardButton("20", callback_data=f"count:{setup_id}:20"),
+        ],
+        [
+            InlineKeyboardButton("30", callback_data=f"count:{setup_id}:30"),
+            InlineKeyboardButton("40", callback_data=f"count:{setup_id}:40"),
+        ],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data=f"back:levels:{setup_id}")]
+    ])
 
 def answer_keyboard(quiz_id: str, idx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(f" {l} ", callback_data=f"ans:{quiz_id}:{idx}:{l}") for l in "ABCDE"]])
@@ -699,13 +729,18 @@ async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_review(update.effective_chat.id, context)
 
 async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إظهار معلومات الدعم (رقم الهاتف ومعرف التليجرام)"""
-    message = (
-        "📞 **رقم الدعم**: 0918874659\n\n"
-        "💬 **تيليجرام**: @Othma2003\n\n"
-        "🕒 متاحون للإجابة عن استفساراتكم."
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 دعم عبر رصيد المدار", callback_data="support:balance")],
+        [InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")],
+        [InlineKeyboardButton("📢 أبلغ عن مشكلة", callback_data="support:problem")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]
+    ])
+
+    await update.message.reply_text(
+        "📞 مركز الدعم\n\n"
+        "اختر نوع الدعم الذي تحتاجه:",
+        reply_markup=keyboard
     )
-    await update.message.reply_text(message, parse_mode="Markdown")
 
 async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -720,7 +755,7 @@ async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
-# CALLBACKS
+# CALLBACK HANDLERS (quiz, review, etc.)
 # =============================================================================
 async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -897,91 +932,209 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
+# BACK NAVIGATION & SUPPORT CALLBACKS (NEW)
+# =============================================================================
+async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    target = parts[1] if len(parts) > 1 else "mode"
+
+    if target == "mode":
+        await query.edit_message_text(
+            t(context.user_data, "choose_mode"),
+            reply_markup=mode_keyboard(context.user_data)
+        )
+
+    elif target == "support":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 دعم عبر رصيد المدار", callback_data="support:balance")],
+            [InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")],
+            [InlineKeyboardButton("📢 أبلغ عن مشكلة", callback_data="support:problem")],
+            [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]
+        ])
+
+        await query.edit_message_text(
+            "📞 مركز الدعم\n\n"
+            "اختر نوع الدعم الذي تحتاجه:",
+            reply_markup=keyboard
+        )
+
+    elif target == "levels":
+        if len(parts) != 3:
+            return
+        setup_id = parts[2]
+        pending = context.user_data.get("pending_file")
+        if not pending or pending.get("setup_id") != setup_id:
+            await query.edit_message_text(t(context.user_data, "stale"))
+            return
+        await query.edit_message_text(
+            t(context.user_data, "file_ready_quiz"),
+            reply_markup=level_keyboard(setup_id, context.user_data)
+        )
+
+async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "support:balance":
+        await query.edit_message_text(
+            "💳 دعم عبر رصيد المدار\n\n"
+            "رقم المدار:\n"
+            "`0918874659`\n\n"
+            "بعد إرسال الرصيد، اضغط تواصل مع الدعم واكتب اسمك أو رقم العملية.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")],
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="back:support")]
+            ])
+        )
+
+    elif query.data == "support:contact":
+        context.user_data["awaiting_support_message"] = "contact"
+        await query.edit_message_text(
+            "💬 اكتب رسالتك الآن.\n\n"
+            "مثال:\n"
+            "اسمي أحمد، أرسلت رصيد، وأريد تفعيل الخدمة."
+        )
+
+    elif query.data == "support:problem":
+        context.user_data["awaiting_support_message"] = "problem"
+        await query.edit_message_text(
+            "📢 اكتب المشكلة التي تواجهك الآن.\n\n"
+            "يفضل تكتب:\n"
+            "- نوع الملف\n"
+            "- ماذا ضغطت\n"
+            "- ما الخطأ الذي ظهر لك"
+        )
+
+
+# =============================================================================
+# ADMIN LOG
+# =============================================================================
+async def send_admin_log(context: ContextTypes.DEFAULT_TYPE, text: str):
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_LOG_CHAT_ID,
+            text=text
+        )
+    except Exception as e:
+        logger.warning("Admin log failed: %s", e)
+
+
+# =============================================================================
 # FILE HANDLING
 # =============================================================================
-def classify_document(mime: str, name: str) -> Optional[str]:
-    mime = (mime or "").lower()
-    name = (name or "").lower()
-    if mime == "application/pdf" or name.endswith(".pdf"): return "pdf"
-    if mime in ("image/jpeg","image/jpg","image/png","image/webp") or name.endswith((".jpg",".jpeg",".png",".webp")): return "image"
-    if "wordprocessingml" in mime or name.endswith(".docx"): return "docx"
-    if mime == "text/plain" or name.endswith(".txt"): return "txt"
-    return None
-
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user and await cooldown_guard(update, context.user_data, user.id): return
+    if user and await cooldown_guard(update, context.user_data, user.id):
+        return
     if context.user_data.get("busy"):
         await update.message.reply_text(t(context.user_data, "busy"))
         return
     context.user_data["busy"] = True
     try:
-        message = update.message
-        mode = context.user_data.get("pending_mode", "quiz")
-        file_name = "photo.jpg"
-        mime_type = "image/jpeg"
-        raw_bytes = b""
-        file_type = ""
-        if message.photo:
-            tg_file = await message.photo[-1].get_file()
-            raw_bytes = bytes(await tg_file.download_as_bytearray())
-            file_type = "image"
-            file_name = "telegram_photo.jpg"
-            mime_type = "image/jpeg"
-        elif message.document:
-            doc = message.document
-            file_name = doc.file_name or "file"
-            mime_type = doc.mime_type or "application/octet-stream"
-            if doc.file_size and doc.file_size > MAX_FILE_SIZE_BYTES:
-                await message.reply_text(t(context.user_data, "file_too_large"))
-                return
-            file_type = classify_document(mime_type, file_name) or ""
-            if not file_type:
-                await message.reply_text(t(context.user_data, "file_unsupported"))
-                return
-            tg_file = await doc.get_file()
-            raw_bytes = bytes(await tg_file.download_as_bytearray())
-        else:
-            await message.reply_text(t(context.user_data, "file_unsupported"))
+        doc = update.message.document
+        if not doc:
+            await update.message.reply_text("⚠️ أرسل ملفاً (PDF, DOCX, PPTX, TXT) وليس صورة.")
             return
-        if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
-            await message.reply_text(t(context.user_data, "file_too_large"))
+
+        await send_admin_log(
+            context,
+            f"📥 ملف جديد\n"
+            f"User: {user.id if user else 'unknown'}\n"
+            f"Name: {user.full_name if user else 'unknown'}\n"
+            f"File: {doc.file_name if doc else 'unknown'}\n"
+            f"Size: {doc.file_size if doc else 'unknown'} bytes"
+        )
+
+        file_type = classify_document(doc.mime_type or "", doc.file_name or "")
+        if file_type == "unsupported":
+            await update.message.reply_text(t(context.user_data, "file_unsupported"))
             return
-        status = await message.reply_text(t(context.user_data, "file_received"))
+
+        if doc.file_size and doc.file_size > MAX_FILE_SIZE_BYTES:
+            await update.message.reply_text(t(context.user_data, "file_too_large"))
+            return
+
+        status = await update.message.reply_text(t(context.user_data, "file_received"))
+        tg_file = await doc.get_file()
+        raw_bytes = bytes(await tg_file.download_as_bytearray())
         file_hash = sha256_bytes(raw_bytes)
+
         cached_file = await db_get_file(file_hash)
         if cached_file:
             text = cached_file["extracted_text"]
             await status.edit_text(t(context.user_data, "cached_file"))
             await asyncio.sleep(0.4)
         else:
-            text = await extract_text(file_type, raw_bytes, mime_type)
-            if not text.strip() or len(text.strip()) < 30:
-                await status.edit_text(t(context.user_data, "file_no_text"))
+            text = extract_text(file_type, raw_bytes)
+            if not text or len(text.strip()) < 100:
+                await status.edit_text(t(context.user_data, "file_empty"))
                 return
-            await db_save_file(file_hash, file_name, len(raw_bytes), mime_type, text)
+            await db_save_file(file_hash, doc.file_name or "document", len(raw_bytes), doc.mime_type or "", text)
+
+        mode = context.user_data.get("pending_mode", "quiz")
         if mode == "summary":
             style = context.user_data.get("pending_summary_style", "disease")
             await status.edit_text(t(context.user_data, "generating_summary"))
             summary = await get_or_create_summary(file_hash, text, style)
             await status.delete()
-            await message.reply_text(t(context.user_data, "summary_header") + summary, parse_mode="Markdown")
+            await update.message.reply_text(t(context.user_data, "summary_header") + summary, parse_mode="Markdown")
             return
+
         setup_id = str(uuid.uuid4())[:8]
         context.user_data["pending_mode"] = "quiz"
-        context.user_data["pending_file"] = {"setup_id": setup_id, "file_hash": file_hash, "file_name": file_name, "text": text}
+        context.user_data["pending_file"] = {
+            "setup_id": setup_id,
+            "file_hash": file_hash,
+            "file_name": doc.file_name or "document",
+            "text": text
+        }
         await status.edit_text(t(context.user_data, "file_ready_quiz"), reply_markup=level_keyboard(setup_id, context.user_data))
+
     except Exception as e:
-        logger.exception("file handling failed")
-        await update.message.reply_text(t(context.user_data, "error", err=str(e)))
+        logger.exception("handle_file error")
+        await update.message.reply_text("❌ حدث خطأ أثناء معالجة الملف. تأكد أن الملف ليس تالفاً.")
     finally:
         context.user_data["busy"] = False
 
+
+# =============================================================================
+# TEXT HANDLER (supports admin forwarding)
+# =============================================================================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text
+
+    support_type = context.user_data.get("awaiting_support_message")
+    if support_type:
+        context.user_data.pop("awaiting_support_message", None)
+
+        kind = "💬 تواصل مع الدعم" if support_type == "contact" else "📢 بلاغ مشكلة"
+
+        await send_admin_log(
+            context,
+            f"{kind}\n\n"
+            f"User ID: {user.id if user else 'unknown'}\n"
+            f"Name: {user.full_name if user else 'unknown'}\n"
+            f"Username: @{user.username if user and user.username else 'لا يوجد'}\n\n"
+            f"Message:\n{text}"
+        )
+
+        await update.message.reply_text(
+            "✅ تم إرسال رسالتك للدعم.\n"
+            "سيتم التواصل معك قريباً إذا احتاج الأمر."
+        )
+        return
+
     if context.user_data.get("session"):
         await update.message.reply_text(t(context.user_data, "quiz_in_progress"))
         return
+
     await update.message.reply_text(t(context.user_data, "send_file_hint"))
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled exception", exc_info=context.error)
@@ -1001,14 +1154,20 @@ BOT_COMMANDS = [
     BotCommand("stats", "Show stats"),
     BotCommand("review", "Review mistakes"),
     BotCommand("language", "Change language"),
-    BotCommand("support", "الدعم"),   # أمر الدعم الجديد
+    BotCommand("support", "الدعم"),
     BotCommand("testbot", "Admin test"),
 ]
 
 async def post_init(application: Application):
     init_db()
+    await cleanup_old_cache(days=30)
     await application.bot.set_my_commands(BOT_COMMANDS)
-    logger.info("Bot ready. Model=%s DB=%s MaxFile=%sMB", GEMINI_MODEL_NAME, DATABASE_PATH, MAX_FILE_SIZE_BYTES // 1024 // 1024)
+    logger.info(
+        "Bot ready. Model=%s DB=%s MaxFile=%sMB",
+        GEMINI_MODEL_NAME,
+        DATABASE_PATH,
+        MAX_FILE_SIZE_BYTES // 1024 // 1024
+    )
 
 def main():
     persistence = PicklePersistence(filepath="bot_user_data.pkl")
@@ -1020,7 +1179,6 @@ def main():
         .post_init(post_init)
         .build()
     )
-    # Add handlers
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -1028,7 +1186,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("review", review_command))
     application.add_handler(CommandHandler("language", language_command))
-    application.add_handler(CommandHandler("support", support_command))  # إضافة معالج الدعم
+    application.add_handler(CommandHandler("support", support_command))
     application.add_handler(CommandHandler("testbot", testbot_command))
     application.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang:"))
     application.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
@@ -1037,16 +1195,13 @@ def main():
     application.add_handler(CallbackQueryHandler(count_callback, pattern=r"^count:"))
     application.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^ans:"))
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
-    # File filters
-    class SupportedFileFilter(filters.MessageFilter):
-        def filter(self, message):
-            if message.photo: return True
-            doc = message.document
-            if not doc: return False
-            return classify_document(doc.mime_type or "", doc.file_name or "") is not None
-    application.add_handler(MessageHandler(filters.PHOTO, handle_file))
-    application.add_handler(MessageHandler(SupportedFileFilter(), handle_file))
+    application.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
+    application.add_handler(CallbackQueryHandler(back_callback, pattern=r"^back:"))
+
+    # Document handler only (no photo)
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     logger.info("Starting bot polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
