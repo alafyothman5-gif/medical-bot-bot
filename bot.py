@@ -11,6 +11,7 @@ Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
 - File-based persistence for /workspace
 - Concurrent generation locks to prevent duplicate API calls
 - Fixed: Medical safety filters, 4-option MCQs, long summary chunking, hard tier prompts, and answer/review chunking
+- OPTIMIZED: aiohttp instead of urllib, removed read DB locks, disabled Pickle, 12K char limit
 """
 
 import asyncio
@@ -24,11 +25,10 @@ import re
 import sqlite3
 import time
 import uuid
-import urllib.request
-import urllib.error
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp  # <-- تم استبدال urllib بهذه المكتبة القوية
 from docx import Document
 from pptx import Presentation
 from pypdf import PdfReader
@@ -40,8 +40,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    PicklePersistence,
     filters,
+    # PicklePersistence, <- تم الاستغناء عنها لتسريع السيرفر
 )
 
 # =============================================================================
@@ -68,8 +68,12 @@ DATABASE_PATH = os.environ.get(
     "/workspace/bot_cache.sqlite3"
 )
 MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024
-MAX_TEXT_CHARS_FOR_AI = 20000
-MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "2"))
+
+# تم تقليل الحد من 20000 إلى 12000 لتوفير التوكنز وتسريع الاستجابة
+MAX_TEXT_CHARS_FOR_AI = 12000 
+
+# تم رفع عدد العمليات المتزامنة الافتراضية إلى 4 لخدمة المستخدمين بذكاء
+MAX_CONCURRENT_GEMINI = int(os.environ.get("MAX_CONCURRENT_GEMINI", "4"))
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "20"))
 
 ADMIN_USER_IDS = {1692255414}
@@ -92,6 +96,7 @@ def get_generation_lock(key: str) -> asyncio.Lock:
 SUPPORTED_LANGS = ("en", "ar")
 
 TRANSLATIONS = {
+    # ... (نفس الترجمات السابقة)
     "en": {
         "choose_lang": "🌐 Choose your language\nاختر لغتك",
         "welcome": "Welcome to your Smart Medical Assistant 🩺\n\nSend a medical PDF, DOCX, PPTX, or TXT file.",
@@ -200,11 +205,9 @@ TRANSLATIONS = {
     },
 }
 
-
 def get_lang(user_data: dict) -> str:
     lang = user_data.get("lang", "ar")
     return lang if lang in SUPPORTED_LANGS else "ar"
-
 
 def t(user_data: dict, key: str, **kwargs) -> str:
     lang = get_lang(user_data)
@@ -261,14 +264,14 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+# تمت إزالة _db_lock هنا لتسريع القراءة المتزامنة
 async def db_get_file(file_hash: str) -> Optional[dict]:
-    async with _db_lock:
-        def work():
-            conn = _db_connect()
-            row = conn.execute("SELECT * FROM files WHERE file_hash=?", (file_hash,)).fetchone()
-            conn.close()
-            return dict(row) if row else None
-        return await asyncio.to_thread(work)
+    def work():
+        conn = _db_connect()
+        row = conn.execute("SELECT * FROM files WHERE file_hash=?", (file_hash,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    return await asyncio.to_thread(work)
 
 async def db_save_file(file_hash: str, file_name: str, file_size: int, mime_type: str, extracted_text: str) -> None:
     async with _db_lock:
@@ -282,19 +285,19 @@ async def db_save_file(file_hash: str, file_name: str, file_size: int, mime_type
             conn.close()
         await asyncio.to_thread(work)
 
+# تمت إزالة _db_lock هنا أيضاً لتسريع القراءة
 async def db_get_questions(file_hash: str, level: str) -> Optional[List[dict]]:
-    async with _db_lock:
-        def work():
-            conn = _db_connect()
-            row = conn.execute("SELECT questions_json FROM question_banks WHERE file_hash=? AND level=?", (file_hash, level)).fetchone()
-            conn.close()
-            if not row:
-                return None
-            try:
-                return json.loads(row["questions_json"])
-            except:
-                return None
-        return await asyncio.to_thread(work)
+    def work():
+        conn = _db_connect()
+        row = conn.execute("SELECT questions_json FROM question_banks WHERE file_hash=? AND level=?", (file_hash, level)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        try:
+            return json.loads(row["questions_json"])
+        except:
+            return None
+    return await asyncio.to_thread(work)
 
 async def db_save_questions(file_hash: str, level: str, questions: List[dict]) -> None:
     async with _db_lock:
@@ -308,14 +311,14 @@ async def db_save_questions(file_hash: str, level: str, questions: List[dict]) -
             conn.close()
         await asyncio.to_thread(work)
 
+# تمت إزالة _db_lock لتسريع قراءة الملخصات
 async def db_get_summary(file_hash: str, style: str) -> Optional[str]:
-    async with _db_lock:
-        def work():
-            conn = _db_connect()
-            row = conn.execute("SELECT summary_text FROM summaries WHERE file_hash=? AND style=?", (file_hash, style)).fetchone()
-            conn.close()
-            return row["summary_text"] if row else None
-        return await asyncio.to_thread(work)
+    def work():
+        conn = _db_connect()
+        row = conn.execute("SELECT summary_text FROM summaries WHERE file_hash=? AND style=?", (file_hash, style)).fetchone()
+        conn.close()
+        return row["summary_text"] if row else None
+    return await asyncio.to_thread(work)
 
 async def db_save_summary(file_hash: str, style: str, summary: str) -> None:
     async with _db_lock:
@@ -474,49 +477,37 @@ def increment_daily_usage(user_data: dict, kind: str) -> None:
 
 
 # =============================================================================
-# OPENROUTER API
+# OPENROUTER API (OPTIMIZED WITH aiohttp)
 # =============================================================================
 async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: int = 4096) -> str:
     async with _GEMINI_SEMAPHORE:
-        def work():
-            payload = {
-                "model": GEMINI_MODEL_NAME,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": temperature,
-                "max_tokens": max_output_tokens,
-            }
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://telegram.org",
-                    "X-Title": "Medical Telegram Bot",
-                },
-                method="POST",
-            )
-            try:
-                print(f"--> [OpenRouter] Sending request. Tokens: {max_output_tokens}")
-                with urllib.request.urlopen(req, timeout=120) as response:
-                    raw_data = response.read().decode("utf-8")
-                    data = json.loads(raw_data)
-                    
-                    if "choices" not in data:
-                        print(f"❌ [OpenRouter] Error Format Received: {raw_data}")
-                        return ""
-                        
-                    print("<-- [OpenRouter] Response received successfully!")
-                    return data["choices"][0]["message"]["content"].strip()
-                    
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode('utf-8')
-                print(f"❌ [OpenRouter] HTTP ERROR {e.code}: {error_body}")
-                raise Exception(f"HTTP {e.code}: {error_body[:200]}")
-            except Exception as e:
-                print(f"❌ [OpenRouter] UNKNOWN ERROR: {str(e)}")
-                raise e
-        return await asyncio.to_thread(work)
+        payload = {
+            "model": GEMINI_MODEL_NAME,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_output_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://telegram.org",
+            "X-Title": "Medical Telegram Bot",
+        }
+        try:
+            print(f"--> [OpenRouter] Sending request. Tokens: {max_output_tokens}")
+            async with aiohttp.ClientSession() as session:
+                async with session.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        print("<-- [OpenRouter] Response received successfully!")
+                        return data["choices"][0]["message"]["content"].strip()
+                    else:
+                        error_text = await response.text()
+                        print(f"❌ [OpenRouter] HTTP ERROR {response.status}: {error_text}")
+                        raise Exception(f"HTTP {response.status}: {error_text[:200]}")
+        except Exception as e:
+            print(f"❌ [OpenRouter] UNKNOWN ERROR: {str(e)}")
+            raise e
 
 
 # =============================================================================
@@ -596,7 +587,8 @@ def extract_json_array(raw: str) -> Optional[list]:
     except Exception:
         pass
 
-    raw = raw.replace("```json", "").replace("```", "").strip()
+    raw = raw.replace("```json", "").replace("
+```", "").strip()
 
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if match:
@@ -1378,13 +1370,11 @@ async def post_init(application: Application):
     )
 
 def main():
-    persistence = PicklePersistence(
-        filepath="/workspace/bot_user_data.pkl"
-    )
+    # تم الاستغناء عن PicklePersistence لتحرير قرص السيرفر وتفادي الاختناق
     application = (
         ApplicationBuilder()
         .token(TOKEN)
-        .persistence(persistence)
+        # .persistence(persistence)  <-- معطلة للأداء السريع
         .concurrent_updates(True)
         .post_init(post_init)
         .build()
