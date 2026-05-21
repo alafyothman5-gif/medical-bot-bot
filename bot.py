@@ -10,7 +10,7 @@ Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
 - Disease key disease_v2, summary empty check & error feedback
 - File-based persistence for /workspace
 - Concurrent generation locks to prevent duplicate API calls
-- Fixed: Medical safety filters, 4-option MCQs, and long summary chunking
+- Fixed: Medical safety filters, 4-option MCQs, long summary chunking, and hard tier prompts
 """
 
 import asyncio
@@ -574,9 +574,9 @@ Exactly 5 options A-E. correct is one of A-E. Base only on source text."""
 ACADEMIC_PREFIX = "Educational medical simulation. Do not provide real medical advice. "
 
 LEVEL_PROMPTS = {
-    "basic": f"{ACADEMIC_PREFIX}BASIC direct MCQs. No vignettes. {QUESTION_SCHEMA}",
-    "cases": f"{ACADEMIC_PREFIX}CLINICAL CASE MCQs. Short patient scenarios. {QUESTION_SCHEMA}",
-    "challenge": f"{ACADEMIC_PREFIX}CHALLENGE MCQs. Two-step reasoning. {QUESTION_SCHEMA}",
+    "basic": f"{ACADEMIC_PREFIX}Generate direct medical recall MCQs. Straightforward factual questions. No patient vignettes. {QUESTION_SCHEMA}",
+    "cases": f"{ACADEMIC_PREFIX}Generate USMLE Step 2 CK level CLINICAL VIGNETTES. Write detailed patient scenarios including age, gender, chief complaint, vital signs, relevant physical exam, and lab findings. The question must ask for the 'most likely diagnosis', 'next best step in management', or 'best initial test'. Distractors must be highly plausible differential diagnoses. {QUESTION_SCHEMA}",
+    "challenge": f"{ACADEMIC_PREFIX}Generate EXTREMELY HARD, multi-step clinical reasoning MCQs (USMLE Step 1/Step 2 CK Hard tier). The student must first diagnose an atypical or complex presentation from a vignette, and then answer a 2nd or 3rd order question (e.g., underlying pathophysiology, specific pharmacological mechanism of action, embryological origin, or specific genetic mutation). All 5 options must be highly homogeneous and tricky, requiring deep analytical thinking to differentiate. {QUESTION_SCHEMA}",
 }
 
 SUMMARY_PROMPTS = {
@@ -596,8 +596,7 @@ def extract_json_array(raw: str) -> Optional[list]:
     except Exception:
         pass
 
-        raw = raw.replace("```json", "").replace("```", "").strip()
-
+    raw = raw.replace("```json", "").replace("```", "").strip()
 
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if match:
