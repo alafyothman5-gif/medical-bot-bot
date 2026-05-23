@@ -149,6 +149,13 @@ TRANSLATIONS = {
         "stats_text": "📊 Your Statistics\n\nQuizzes: {quizzes}\nCorrect: {correct}/{total}\nAccuracy: {accuracy}%\nBest score: {best}%",
         "error": "⚠️ Error: {err}",
         "summary_failed": "⚠️ Failed to generate summary. Please try again or use another file.",
+        "home_title": "🩺 MedMCQ AI Academy\n\n🎓 Your smart medical learning platform.\n\nChoose a section:",
+        "osce_intro": "👨‍⚕️ OSCE Simulator\n\nThis section will simulate a real OSCE station.\n\nPlanned flow:\n1) Send a lecture/file\n2) I create a hidden patient case\n3) You ask history questions\n4) Exam, labs, imaging appear only when requested\n5) Final diagnosis + scoring\n\n🚧 Coming next update.",
+        "progress_text": "📊 My Progress\n\n🔥 Streak: 0 days\n⭐ XP: 0\n🎚 Level: 1\n\nYour quiz scores will be linked here in the next update.",
+        "leaderboard_text": "🏆 Leaderboard\n\nWeekly and monthly rankings are being prepared.\n\nSoon: top students by XP, streak, and quiz accuracy.",
+        "streak_text": "🔥 Daily Streak\n\nCome back daily, solve quizzes, and keep your streak alive.\n\nCurrent streak: 0 days",
+        "payment_text": "💎 Subscription & Payment\n\nFree plan is active.\n\nPremium will include higher limits, OSCE access, priority queue, and more.\n\nPayment settings will be added later.",
+        "coming_soon": "🚧 This feature is being prepared.",
     },
     "ar": {
         "choose_lang": "🌐 اختر لغتك",
@@ -202,6 +209,13 @@ TRANSLATIONS = {
         "stats_text": "📊 إحصائياتك\n\nالاختبارات: {quizzes}\nالصحيح: {correct}/{total}\nالدقة: {accuracy}%\nأفضل نتيجة: {best}%",
         "error": "⚠️ خطأ: {err}",
         "summary_failed": "⚠️ فشل توليد الملخص. حاول مرة أخرى أو استخدم ملفاً آخر.",
+        "home_title": "🩺 أكاديمية MedMCQ AI\n\n🎓 منصتك الذكية لمذاكرة الطب.\n\nاختر القسم:",
+        "osce_intro": "👨‍⚕️ محاكي OSCE\n\nهذا القسم سيحاكي لجنة أوسكي حقيقية.\n\nالخطة:\n1) ترسل محاضرة/ملف\n2) البوت يصنع حالة مريض مخفية\n3) أنت تسأل أسئلة History\n4) الفحص والحقائق والتحاليل والأشعة لا تظهر إلا إذا طلبتها\n5) في النهاية يعطيك التشخيص والتقييم\n\n🚧 سيتم تفعيله في التحديث القادم.",
+        "progress_text": "📊 تقدمي\n\n🔥 الستريك: 0 يوم\n⭐ نقاط الخبرة XP: 0\n🎚 المستوى: 1\n\nسيتم ربط نتائج الاختبارات هنا في التحديث القادم.",
+        "leaderboard_text": "🏆 لوحة الصدارة\n\nالترتيب الأسبوعي والشهري قيد التجهيز.\n\nقريباً: أفضل الطلاب حسب XP والستريك والدقة.",
+        "streak_text": "🔥 الستريك اليومي\n\nادخل يومياً، حل اختبارات، وحافظ على الستريك.\n\nالستريك الحالي: 0 يوم",
+        "payment_text": "💎 الاشتراك والدفع\n\nالخطة المجانية مفعلة.\n\nPremium سيعطي حدود أعلى، أوسكي، أولوية في الطابور، ومميزات أكثر.\n\nسيتم تعديل بيانات الدفع لاحقاً.",
+        "coming_soon": "🚧 هذه الميزة قيد التجهيز.",
     },
 }
 
@@ -587,8 +601,7 @@ def extract_json_array(raw: str) -> Optional[list]:
     except Exception:
         pass
 
-    raw = raw.replace("```json", "").replace("
-```", "").strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
 
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if match:
@@ -743,10 +756,27 @@ def lang_keyboard() -> InlineKeyboardMarkup:
     ])
 
 def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
+    """Main academy menu. Existing quiz/summary flows are preserved."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(user_data, "mode_quiz"), callback_data="mode:quiz")],
-        [InlineKeyboardButton(t(user_data, "mode_summary"), callback_data="mode:summary")],
-        [InlineKeyboardButton("📞 الدعم", callback_data="back:support")]
+        [
+            InlineKeyboardButton("📝 بنك الأسئلة", callback_data="mode:quiz"),
+            InlineKeyboardButton("📚 الملخصات", callback_data="mode:summary"),
+        ],
+        [
+            InlineKeyboardButton("👨‍⚕️ محاكي OSCE", callback_data="academy:osce"),
+        ],
+        [
+            InlineKeyboardButton("📊 تقدمي و XP", callback_data="academy:progress"),
+            InlineKeyboardButton("🔥 الستريك", callback_data="academy:streak"),
+        ],
+        [
+            InlineKeyboardButton("🏆 لوحة الصدارة", callback_data="academy:leaderboard"),
+            InlineKeyboardButton("💎 الاشتراك", callback_data="academy:payment"),
+        ],
+        [
+            InlineKeyboardButton("📞 الدعم", callback_data="back:support"),
+            InlineKeyboardButton("🌐 اللغة", callback_data="academy:language"),
+        ],
     ])
 
 def summary_style_keyboard(user_data: dict) -> InlineKeyboardMarkup:
@@ -855,7 +885,20 @@ async def send_final_score(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
 # COMMANDS HANDLERS
 # =============================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
+    welcome_text = (
+        "🩺 MedMCQ AI Academy\n\n"
+        "🎓 منصة ذكية لطلبة الطب\n"
+        "━━━━━━━━━━━━━━\n"
+        "📚 ملخصات من ملفاتك\n"
+        "📝 أسئلة تفاعلية Basic / Cases / Challenge\n"
+        "👨‍⚕️ محاكي OSCE ذكي\n"
+        "🔥 ستريك + XP + مستويات\n"
+        "🏆 لوحة صدارة أسبوعية وشهرية\n"
+        "💎 اشتراكات وحدود استخدام\n"
+        "━━━━━━━━━━━━━━\n"
+        "اختر لغتك للبدء:"
+    )
+    await update.message.reply_text(welcome_text, reply_markup=lang_keyboard())
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t(context.user_data, "help"))
@@ -918,8 +961,7 @@ async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, lang = query.data.split(":", 1)
     if lang not in SUPPORTED_LANGS: return
     context.user_data["lang"] = lang
-    await query.edit_message_text(t(context.user_data, "welcome"))
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "choose_mode"), reply_markup=mode_keyboard(context.user_data))
+    await query.edit_message_text(t(context.user_data, "home_title"), reply_markup=mode_keyboard(context.user_data))
 
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1117,6 +1159,60 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=chat_id, text=chunk.replace("*", ""))
 
 
+
+async def academy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+
+    if action == "osce":
+        await query.edit_message_text(
+            t(context.user_data, "osce_intro"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📚 أرسل ملف لتجهيز حالة لاحقاً", callback_data="mode:quiz")],
+                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
+            ])
+        )
+
+    elif action == "progress":
+        await query.edit_message_text(
+            t(context.user_data, "progress_text"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 إحصائياتي الحالية", callback_data="review:stats")],
+                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
+            ])
+        )
+
+    elif action == "leaderboard":
+        await query.edit_message_text(
+            t(context.user_data, "leaderboard_text"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
+            ])
+        )
+
+    elif action == "streak":
+        await query.edit_message_text(
+            t(context.user_data, "streak_text"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📝 ابدأ اختبار", callback_data="mode:quiz")],
+                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
+            ])
+        )
+
+    elif action == "payment":
+        await query.edit_message_text(
+            t(context.user_data, "payment_text"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📞 تواصل مع الدعم", callback_data="back:support")],
+                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
+            ])
+        )
+
+    elif action == "language":
+        await query.edit_message_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
+
+
 # =============================================================================
 # BACK NAVIGATION & SUPPORT CALLBACKS
 # =============================================================================
@@ -1129,7 +1225,7 @@ async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if target == "mode":
         await query.edit_message_text(
-            t(context.user_data, "choose_mode"),
+            t(context.user_data, "home_title"),
             reply_markup=mode_keyboard(context.user_data)
         )
 
@@ -1391,6 +1487,7 @@ def main():
     application.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang:"))
     application.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
     application.add_handler(CallbackQueryHandler(summary_style_callback, pattern=r"^style:"))
+    application.add_handler(CallbackQueryHandler(academy_callback, pattern=r"^academy:"))
     application.add_handler(CallbackQueryHandler(level_callback, pattern=r"^level:"))
     application.add_handler(CallbackQueryHandler(count_callback, pattern=r"^count:"))
     application.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^ans:"))
