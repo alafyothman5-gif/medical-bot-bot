@@ -953,79 +953,209 @@ def extract_json_object(raw: str) -> Optional[dict]:
             return None
     return None
 
+def _safe_short_text(value: object, fallback: str, max_len: int = 160) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = fallback
+    text = re.sub(r"\s+", " ", text)
+    # Prevent accidental station leak in opening line.
+    banned_words = [
+        "diagnosis", "most likely", "management", "treatment", "ultrasound",
+        "cbc", "beta", "hcg", "ectopic", "pre-eclampsia", "preeclampsia",
+        "appendicitis", "fibroid", "carcinoma", "cancer"
+    ]
+    low = text.lower()
+    if any(w in low for w in banned_words) or len(text) > max_len:
+        return fallback
+    return text[:max_len].strip()
+
+def normalize_osce_case(case: dict) -> dict:
+    """Make sure the OSCE case stays hidden and interactive, not a full lecture dump."""
+    if not isinstance(case, dict):
+        case = {}
+
+    history = case.get("history") if isinstance(case.get("history"), dict) else {}
+
+    normalized = {
+        "station_title": _safe_short_text(case.get("station_title"), "OSCE Station", 80),
+        "patient_role": _safe_short_text(case.get("patient_role"), "patient", 40),
+        "opening_statement": _safe_short_text(
+            case.get("opening_statement"),
+            "Doctor, I have a problem and I am worried.",
+            120
+        ),
+        "hidden_diagnosis": str(case.get("hidden_diagnosis") or "Not specified").strip(),
+        "history": {
+            "presenting_complaint": str(history.get("presenting_complaint") or "The patient has a symptom related to the lecture.").strip(),
+            "hpi": str(history.get("hpi") or "Reveal only when the student asks focused history questions.").strip(),
+            "pmh": str(history.get("pmh") or "No known major past medical history unless asked.").strip(),
+            "medications": str(history.get("medications") or "No regular medications unless asked.").strip(),
+            "allergies": str(history.get("allergies") or "No known allergies unless asked.").strip(),
+            "family_social": str(history.get("family_social") or "No relevant family/social history unless asked.").strip(),
+            "ob_gyn_or_system_specific": str(history.get("ob_gyn_or_system_specific") or "Ask system-specific questions to reveal details.").strip(),
+        },
+        "examination": str(case.get("examination") or "General appearance and focused examination findings are not available.").strip(),
+        "vitals": str(case.get("vitals") or "Vital signs are not specified.").strip(),
+        "labs": str(case.get("labs") or "No laboratory results are available.").strip(),
+        "imaging": str(case.get("imaging") or "No imaging findings are available.").strip(),
+        "management_expected": str(case.get("management_expected") or "Assess safely and manage according to standard teaching.").strip(),
+        "red_flags": case.get("red_flags") if isinstance(case.get("red_flags"), list) else [],
+        "mark_scheme": case.get("mark_scheme") if isinstance(case.get("mark_scheme"), list) else [],
+    }
+    return normalized
+
 async def generate_osce_case(text: str) -> dict:
     source = text[:MAX_TEXT_CHARS_FOR_AI]
     prompt = f"""
 Educational OSCE simulation only. Create ONE realistic OSCE station from the source lecture.
-Return valid JSON object only, no markdown.
+
+Return valid JSON object only. No markdown. No explanation outside JSON.
+
+CRITICAL DESIGN:
+- The case must be hidden from the student.
+- opening_statement must be ONLY one short patient sentence, maximum 12 words.
+- opening_statement must NOT contain the diagnosis, investigations, examination, management, or hints.
+- Do NOT write a full case stem for the student.
+- The student must discover information by asking questions.
+- Make history details available in the hidden JSON only.
+- If the source is about obstetrics/gynecology, make the station appropriate to that topic.
+
 Schema:
 {{
-  "station_title": "...",
+  "station_title": "Neutral title, e.g. Abdominal pain station; do not reveal diagnosis",
   "patient_role": "patient or relative",
-  "opening_statement": "A short first sentence the patient says when greeted, without diagnosis",
-  "hidden_diagnosis": "...",
-  "history": {{"presenting_complaint":"...", "hpi":"...", "pmh":"...", "medications":"...", "allergies":"...", "family_social":"...", "ob_gyn_or_system_specific":"..."}},
-  "examination": "Findings only if student asks for examination",
-  "labs": "Lab results only if student asks for labs/investigations",
-  "imaging": "Imaging or scan findings only if student asks for imaging",
-  "management_expected": "Expected management points",
+  "opening_statement": "Short symptom complaint only",
+  "hidden_diagnosis": "hidden diagnosis for examiner only",
+  "history": {{
+    "presenting_complaint": "...",
+    "hpi": "Full hidden HPI details to reveal gradually only when asked",
+    "pmh": "...",
+    "medications": "...",
+    "allergies": "...",
+    "family_social": "...",
+    "ob_gyn_or_system_specific": "LMP, pregnancy, bleeding, contraception, obstetric history etc if relevant"
+  }},
+  "vitals": "Vital signs only if student asks",
+  "examination": "Physical examination findings only if student asks",
+  "labs": "Lab/investigation results only if student asks",
+  "imaging": "Imaging findings only if student asks",
+  "management_expected": "Expected management points for examiner feedback only",
   "red_flags": ["..."],
-  "mark_scheme": ["...", "..."]
+  "mark_scheme": ["history point", "exam point", "investigation point", "management point"]
 }}
-Rules: Do not reveal diagnosis in opening_statement. Make the case medically coherent and exam focused.
+
 SOURCE TEXT:
 {source}
 """
-    raw = await call_gemini(prompt, temperature=0.25, max_output_tokens=4096)
+    raw = await call_gemini(prompt, temperature=0.18, max_output_tokens=4096)
     parsed = extract_json_object(raw)
-    if not parsed:
-        return {
-            "station_title": "OSCE Station",
-            "patient_role": "patient",
-            "opening_statement": "Doctor, I am worried about my symptoms.",
-            "hidden_diagnosis": "Not specified",
-            "history": {"presenting_complaint": "Symptoms based on the lecture", "hpi": "Ask focused questions to reveal more."},
-            "examination": "No examination data generated.",
-            "labs": "No lab data generated.",
-            "imaging": "No imaging data generated.",
-            "management_expected": "Provide appropriate assessment and management.",
-            "red_flags": [],
-            "mark_scheme": []
-        }
-    return parsed
+    return normalize_osce_case(parsed or {})
+
+def detect_osce_intent(text: str) -> str:
+    tmsg = (text or "").lower()
+    exam_words = [
+        "examination", "examine", "physical", "vital", "vitals", "bp", "pulse",
+        "فحص", "افحص", "اكشف", "كشف", "العلامات الحيوية", "ضغط", "نبض", "حرارة"
+    ]
+    lab_words = [
+        "lab", "labs", "investigation", "investigations", "test", "cbc", "hcg", "urine",
+        "تحليل", "تحاليل", "فحوصات", "فحص دم", "بول", "اختبار", "hcg", "bhcg"
+    ]
+    imaging_words = [
+        "imaging", "ultrasound", "scan", "xray", "x-ray", "ct", "mri",
+        "تصوير", "سونار", "ألتراساوند", "التراساوند", "اشعة", "أشعة"
+    ]
+    diagnosis_words = [
+        "diagnosis", "what does she have", "what is it", "تشخيص", "شنو عندها", "ما التشخيص", "ماهو التشخيص"
+    ]
+    management_words = [
+        "management", "treatment", "plan", "دواء", "علاج", "خطة", "تدبير", "نعالج"
+    ]
+    if any(w in tmsg for w in exam_words):
+        return "exam"
+    if any(w in tmsg for w in lab_words):
+        return "labs"
+    if any(w in tmsg for w in imaging_words):
+        return "imaging"
+    if any(w in tmsg for w in diagnosis_words):
+        return "diagnosis"
+    if any(w in tmsg for w in management_words):
+        return "management"
+    return "history"
+
+def osce_prepared_response(session: dict, intent: str) -> Optional[str]:
+    case = session.get("case", {})
+    asked = session.setdefault("asked", {"exam": False, "labs": False, "imaging": False})
+    if intent == "exam":
+        asked["exam"] = True
+        return "🩺 Findings available on examination:\n\n" + str(case.get("vitals", "")) + "\n\n" + str(case.get("examination", "No examination findings available."))
+    if intent == "labs":
+        asked["labs"] = True
+        return "🧪 Investigation results:\n\n" + str(case.get("labs", "No lab results available."))
+    if intent == "imaging":
+        asked["imaging"] = True
+        return "🩻 Imaging findings:\n\n" + str(case.get("imaging", "No imaging findings available."))
+    if intent == "diagnosis":
+        return "أنا كمريض لا أعرف التشخيص يا دكتور. يمكنك إنهاء المحطة عندما تكون جاهزًا للتقييم."
+    if intent == "management":
+        return "أنا أريد أن أعرف ما الخطة يا دكتور، لكن لا أعرف العلاج المناسب بنفسي."
+    return None
 
 async def osce_patient_reply(session: dict, student_message: str) -> str:
     case = session.get("case", {})
-    history = session.get("history", [])[-12:]
-    prompt = f"""
-You are role-playing as an OSCE patient for medical student training.
-IMPORTANT RULES:
-- Reply ONLY as the patient/relative, not as a teacher.
-- Do NOT reveal the hidden diagnosis unless the student explicitly explains it at the end.
-- Do NOT volunteer examination, lab, imaging, or management information unless the student asks for that category.
-- If asked for examination/labs/imaging, provide only the prepared findings from the case.
-- Keep answers realistic, short, and natural.
-- No hints. No differential diagnosis. No teaching unless OSCE is ended.
+    intent = detect_osce_intent(student_message)
 
-CASE JSON:
+    prepared = osce_prepared_response(session, intent)
+    if prepared:
+        return prepared
+
+    history = session.get("history", [])[-10:]
+    prompt = f"""
+You are role-playing as a REAL OSCE patient/relative for medical student training.
+
+ABSOLUTE RULES:
+- Reply ONLY as the patient/relative.
+- Never act as examiner, teacher, or assistant.
+- Do NOT reveal hidden diagnosis.
+- Do NOT reveal examination, vitals, labs, imaging, or management unless specifically requested.
+- The student asked a HISTORY question. Answer only that question from the hidden case.
+- Keep reply short: 1-3 sentences maximum.
+- No hints, no differential diagnosis, no teaching.
+- If asked broad question, give only a natural patient answer.
+- If Arabic question, answer in Arabic colloquial/clear Arabic. If English, answer in English.
+
+HIDDEN CASE JSON:
 {json.dumps(case, ensure_ascii=False)}
 
 RECENT CHAT:
 {json.dumps(history, ensure_ascii=False)}
 
-STUDENT MESSAGE:
+STUDENT QUESTION:
 {student_message}
 
-Patient reply:
+Patient reply only:
 """
-    return await call_gemini(prompt, temperature=0.35, max_output_tokens=900)
+    reply = await call_gemini(prompt, temperature=0.25, max_output_tokens=500)
+    # Safety: trim accidental long lecture output.
+    reply = (reply or "").strip()
+    if len(reply) > 900:
+        reply = reply[:900].rsplit(".", 1)[0] + "."
+    return reply
 
 async def osce_examiner_feedback(session: dict) -> str:
     case = session.get("case", {})
     history = session.get("history", [])
+    asked = session.get("asked", {})
     prompt = f"""
-You are an OSCE examiner. Evaluate the student's performance based on the case and chat.
-Give concise structured feedback in Arabic if the chat is Arabic, otherwise English.
+You are an OSCE examiner. Evaluate the student's performance based on the hidden case and chat.
+Give structured feedback in Arabic if the chat is Arabic, otherwise English.
+
+Be fair:
+- Do not give high marks if the student did not ask history.
+- Penalize if they did not ask examination, labs, or imaging when relevant.
+- Mention exactly what they missed.
+- Include model answer at the end.
+
 Include:
 - Overall score /100
 - History score /25
@@ -1035,15 +1165,20 @@ Include:
 - Management & counseling /15
 - Missed key questions
 - Missed red flags
+- Correct final diagnosis
+- Ideal management
 - What to improve next time
 
-CASE:
+HIDDEN CASE:
 {json.dumps(case, ensure_ascii=False)}
+
+ASKED CATEGORIES:
+{json.dumps(asked, ensure_ascii=False)}
 
 CHAT:
 {json.dumps(history, ensure_ascii=False)}
 """
-    return await call_gemini(prompt, temperature=0.2, max_output_tokens=2000)
+    return await call_gemini(prompt, temperature=0.15, max_output_tokens=2500)
 
 # =============================================================================
 # KEYBOARDS
@@ -1774,8 +1909,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user:
                 await db_add_xp(user.id, 10, "OSCE case started")
             opening = str(case.get("opening_statement", "Doctor, I am worried about my symptoms."))
-            title = str(case.get("station_title", "OSCE Station"))
-            await status.edit_text(f"{t(context.user_data, 'osce_ready')}\n\n📌 {title}\n\n🧑‍🦱 Patient: {opening}", reply_markup=osce_keyboard())
+            await status.edit_text(
+                f"{t(context.user_data, 'osce_ready')}\n\n"
+                f"🧑‍🦱 المريض/Patient: {opening}\n\n"
+                "ابدأ بسؤال المريض. لن تظهر الفحوصات أو التحاليل أو الأشعة إلا إذا طلبتها أنت.",
+                reply_markup=osce_keyboard()
+            )
             return
 
         if mode == "summary":
