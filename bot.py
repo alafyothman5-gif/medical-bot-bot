@@ -81,6 +81,11 @@ ADMIN_LOG_CHAT_ID = int(os.environ.get("ADMIN_LOG_CHAT_ID", "-1003987051773"))
 
 _GEMINI_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
 
+# Lightweight in-memory pressure indicators.
+_ACTIVE_AI_JOBS = 0
+_WAITING_AI_JOBS = 0
+_AI_QUEUE_LOCK = asyncio.Lock()
+
 # Generation locks to prevent duplicate expensive API calls
 _generation_locks: Dict[str, asyncio.Lock] = {}
 
@@ -104,8 +109,13 @@ TRANSLATIONS = {
         "choose_mode": "📂 Choose mode:",
         "mode_quiz": "📝 Quiz",
         "mode_summary": "📚 Summary",
+        "mode_osce": "🎭 OSCE Simulator",
+        "mode_progress": "📊 Progress & XP",
+        "mode_leaderboard": "🏆 Leaderboard",
+        "mode_subscription": "💎 Subscription",
         "mode_quiz_prompt": "📝 Quiz mode selected. Send your file.",
         "mode_summary_prompt": "📚 Summary mode selected. Choose style, then send your file.",
+        "mode_osce_prompt": "🎭 OSCE mode selected. Send a medical lecture file, and I will create an interactive OSCE case.",
         "summary_style_prompt": "📋 Choose summary style:",
         "style_disease": "🩺 Disease Profile",
         "style_highyield": "🧠 High-Yield",
@@ -149,13 +159,10 @@ TRANSLATIONS = {
         "stats_text": "📊 Your Statistics\n\nQuizzes: {quizzes}\nCorrect: {correct}/{total}\nAccuracy: {accuracy}%\nBest score: {best}%",
         "error": "⚠️ Error: {err}",
         "summary_failed": "⚠️ Failed to generate summary. Please try again or use another file.",
-        "home_title": "🩺 MedMCQ AI Academy\n\n🎓 Your smart medical learning platform.\n\nChoose a section:",
-        "osce_intro": "👨‍⚕️ OSCE Simulator\n\nThis section will simulate a real OSCE station.\n\nPlanned flow:\n1) Send a lecture/file\n2) I create a hidden patient case\n3) You ask history questions\n4) Exam, labs, imaging appear only when requested\n5) Final diagnosis + scoring\n\n🚧 Coming next update.",
-        "progress_text": "📊 My Progress\n\n🔥 Streak: 0 days\n⭐ XP: 0\n🎚 Level: 1\n\nYour quiz scores will be linked here in the next update.",
-        "leaderboard_text": "🏆 Leaderboard\n\nWeekly and monthly rankings are being prepared.\n\nSoon: top students by XP, streak, and quiz accuracy.",
-        "streak_text": "🔥 Daily Streak\n\nCome back daily, solve quizzes, and keep your streak alive.\n\nCurrent streak: 0 days",
-        "payment_text": "💎 Subscription & Payment\n\nFree plan is active.\n\nPremium will include higher limits, OSCE access, priority queue, and more.\n\nPayment settings will be added later.",
-        "coming_soon": "🚧 This feature is being prepared.",
+        "osce_generating": "🎭 Creating your OSCE station...",
+        "osce_ready": "🎭 OSCE Station Ready\n\nYou are the doctor. I am the patient. Start by greeting me and taking the history.\n\nRules: I will not reveal diagnosis unless you ask properly. Ask for examination, labs, imaging, or management when needed. Press End OSCE when finished.",
+        "osce_no_session": "No active OSCE session.",
+        "osce_finished": "✅ OSCE finished. Here is your examiner feedback:",
     },
     "ar": {
         "choose_lang": "🌐 اختر لغتك",
@@ -164,8 +171,13 @@ TRANSLATIONS = {
         "choose_mode": "📂 اختر الوضع:",
         "mode_quiz": "📝 اختبار",
         "mode_summary": "📚 ملخص",
+        "mode_osce": "🎭 محاكي OSCE",
+        "mode_progress": "📊 تقدمي ونقاطي",
+        "mode_leaderboard": "🏆 لوحة الصدارة",
+        "mode_subscription": "💎 الاشتراك والدفع",
         "mode_quiz_prompt": "📝 تم اختيار الاختبار. أرسل الملف.",
         "mode_summary_prompt": "📚 تم اختيار الملخص. اختر نوع الملخص ثم أرسل الملف.",
+        "mode_osce_prompt": "🎭 تم اختيار محاكي OSCE. أرسل ملف محاضرة طبية وسأصنع لك حالة أوسكي تفاعلية.",
         "summary_style_prompt": "📋 اختر نوع الملخص:",
         "style_disease": "🩺 ملف المرض",
         "style_highyield": "🧠 نقاط مهمة",
@@ -209,13 +221,10 @@ TRANSLATIONS = {
         "stats_text": "📊 إحصائياتك\n\nالاختبارات: {quizzes}\nالصحيح: {correct}/{total}\nالدقة: {accuracy}%\nأفضل نتيجة: {best}%",
         "error": "⚠️ خطأ: {err}",
         "summary_failed": "⚠️ فشل توليد الملخص. حاول مرة أخرى أو استخدم ملفاً آخر.",
-        "home_title": "🩺 أكاديمية MedMCQ AI\n\n🎓 منصتك الذكية لمذاكرة الطب.\n\nاختر القسم:",
-        "osce_intro": "👨‍⚕️ محاكي OSCE\n\nهذا القسم سيحاكي لجنة أوسكي حقيقية.\n\nالخطة:\n1) ترسل محاضرة/ملف\n2) البوت يصنع حالة مريض مخفية\n3) أنت تسأل أسئلة History\n4) الفحص والحقائق والتحاليل والأشعة لا تظهر إلا إذا طلبتها\n5) في النهاية يعطيك التشخيص والتقييم\n\n🚧 سيتم تفعيله في التحديث القادم.",
-        "progress_text": "📊 تقدمي\n\n🔥 الستريك: 0 يوم\n⭐ نقاط الخبرة XP: 0\n🎚 المستوى: 1\n\nسيتم ربط نتائج الاختبارات هنا في التحديث القادم.",
-        "leaderboard_text": "🏆 لوحة الصدارة\n\nالترتيب الأسبوعي والشهري قيد التجهيز.\n\nقريباً: أفضل الطلاب حسب XP والستريك والدقة.",
-        "streak_text": "🔥 الستريك اليومي\n\nادخل يومياً، حل اختبارات، وحافظ على الستريك.\n\nالستريك الحالي: 0 يوم",
-        "payment_text": "💎 الاشتراك والدفع\n\nالخطة المجانية مفعلة.\n\nPremium سيعطي حدود أعلى، أوسكي، أولوية في الطابور، ومميزات أكثر.\n\nسيتم تعديل بيانات الدفع لاحقاً.",
-        "coming_soon": "🚧 هذه الميزة قيد التجهيز.",
+        "osce_generating": "🎭 جاري إنشاء محطة OSCE...",
+        "osce_ready": "🎭 محطة OSCE جاهزة\n\nأنت الطبيب، وأنا المريض. ابدأ بالسلام وأخذ التاريخ المرضي.\n\nالقواعد: لن أكشف التشخيص مباشرة. اسأل عن التاريخ، الفحص، التحاليل، الأشعة، والخطة. اضغط إنهاء OSCE عندما تنتهي.",
+        "osce_no_session": "لا توجد جلسة OSCE نشطة.",
+        "osce_finished": "✅ انتهت محطة OSCE. هذا تقييم الممتحن:",
     },
 }
 
@@ -273,6 +282,50 @@ def init_db() -> None:
             summary_text TEXT NOT NULL,
             created_at TEXT,
             PRIMARY KEY (file_hash, style)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            username TEXT,
+            lang TEXT DEFAULT 'ar',
+            plan TEXT DEFAULT 'free',
+            created_at TEXT,
+            last_seen TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_progress (
+            user_id INTEGER PRIMARY KEY,
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            streak INTEGER DEFAULT 0,
+            last_activity_day TEXT,
+            quizzes INTEGER DEFAULT 0,
+            correct INTEGER DEFAULT 0,
+            total INTEGER DEFAULT 0,
+            osce_done INTEGER DEFAULT 0,
+            summaries_done INTEGER DEFAULT 0,
+            updated_at TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS xp_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            points INTEGER,
+            reason TEXT,
+            created_at TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            note TEXT,
+            created_at TEXT
         )
     """)
     conn.commit()
@@ -346,6 +399,129 @@ async def db_save_summary(file_hash: str, style: str, summary: str) -> None:
             conn.close()
         await asyncio.to_thread(work)
 
+
+
+# =============================================================================
+# USER PROGRESS, XP, STREAK, LEADERBOARD, SUBSCRIPTION
+# =============================================================================
+def calc_level(xp: int) -> int:
+    return max(1, int(xp // 250) + 1)
+
+def today_local_key() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+async def db_register_user(user) -> None:
+    if not user:
+        return
+    async with _db_lock:
+        def work():
+            now = datetime.utcnow().isoformat()
+            conn = _db_connect()
+            conn.execute(
+                """INSERT INTO users(user_id, full_name, username, created_at, last_seen)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                   full_name=excluded.full_name,
+                   username=excluded.username,
+                   last_seen=excluded.last_seen""",
+                (user.id, user.full_name or "", user.username or "", now, now)
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO user_progress(user_id, updated_at)
+                   VALUES(?, ?)""",
+                (user.id, now)
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(work)
+
+async def db_add_xp(user_id: int, points: int, reason: str, correct: int = 0, total: int = 0, quiz_done: bool = False, osce_done: bool = False, summary_done: bool = False) -> dict:
+    async with _db_lock:
+        def work():
+            now = datetime.utcnow().isoformat()
+            today = today_local_key()
+            conn = _db_connect()
+            row = conn.execute("SELECT * FROM user_progress WHERE user_id=?", (user_id,)).fetchone()
+            if not row:
+                conn.execute("INSERT OR IGNORE INTO user_progress(user_id, updated_at) VALUES(?, ?)", (user_id, now))
+                row = conn.execute("SELECT * FROM user_progress WHERE user_id=?", (user_id,)).fetchone()
+
+            old_xp = int(row["xp"] or 0)
+            old_level = int(row["level"] or 1)
+            last_day = row["last_activity_day"]
+            streak = int(row["streak"] or 0)
+
+            if last_day != today:
+                try:
+                    prev = datetime.strptime(last_day, "%Y-%m-%d") if last_day else None
+                    current = datetime.strptime(today, "%Y-%m-%d")
+                    if prev and (current - prev).days == 1:
+                        streak += 1
+                    else:
+                        streak = 1
+                except Exception:
+                    streak = 1
+
+            new_xp = old_xp + max(0, int(points))
+            new_level = calc_level(new_xp)
+
+            conn.execute(
+                """UPDATE user_progress
+                   SET xp=?, level=?, streak=?, last_activity_day=?, quizzes=quizzes+?,
+                       correct=correct+?, total=total+?, osce_done=osce_done+?,
+                       summaries_done=summaries_done+?, updated_at=?
+                   WHERE user_id=?""",
+                (new_xp, new_level, streak, today, 1 if quiz_done else 0,
+                 int(correct), int(total), 1 if osce_done else 0, 1 if summary_done else 0, now, user_id)
+            )
+            conn.execute(
+                "INSERT INTO xp_events(user_id, points, reason, created_at) VALUES(?,?,?,?)",
+                (user_id, int(points), reason, now)
+            )
+            conn.commit()
+            out = dict(conn.execute("SELECT * FROM user_progress WHERE user_id=?", (user_id,)).fetchone())
+            conn.close()
+            out["leveled_up"] = new_level > old_level
+            return out
+        return await asyncio.to_thread(work)
+
+async def db_get_progress(user_id: int) -> dict:
+    def work():
+        conn = _db_connect()
+        row = conn.execute("SELECT * FROM user_progress WHERE user_id=?", (user_id,)).fetchone()
+        conn.close()
+        return dict(row) if row else {"xp": 0, "level": 1, "streak": 0, "quizzes": 0, "correct": 0, "total": 0, "osce_done": 0, "summaries_done": 0}
+    return await asyncio.to_thread(work)
+
+async def db_get_leaderboard(limit: int = 10) -> list:
+    def work():
+        conn = _db_connect()
+        rows = conn.execute(
+            """SELECT u.full_name, u.username, p.xp, p.level, p.streak
+               FROM user_progress p
+               LEFT JOIN users u ON u.user_id=p.user_id
+               ORDER BY p.xp DESC, p.level DESC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    return await asyncio.to_thread(work)
+
+async def db_create_payment_request(user_id: int, note: str = "") -> None:
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            conn.execute(
+                "INSERT INTO payments(user_id, status, note, created_at) VALUES(?,?,?,?)",
+                (user_id, "pending", note, datetime.utcnow().isoformat())
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(work)
+
+def ai_queue_status_text() -> str:
+    return f"⚙️ AI Load: active {_ACTIVE_AI_JOBS}/{MAX_CONCURRENT_GEMINI} | waiting {_WAITING_AI_JOBS}"
 
 # =============================================================================
 # AUTO CLEANUP
@@ -445,6 +621,7 @@ def usage_get(user_data: dict) -> dict:
             "cases": 0,
             "challenge": 0,
             "summary": 0,
+            "osce": 0,
         }
         user_data["daily_usage"] = usage
 
@@ -456,6 +633,7 @@ def usage_limit_for(kind: str) -> int:
         "cases": 2,
         "challenge": 1,
         "summary": 3,
+        "osce": 1,
     }
     return limits.get(kind, 0)
 
@@ -478,7 +656,8 @@ async def check_daily_limit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"Basic: 3\n"
             f"Cases: 2\n"
             f"Challenge: 1\n"
-            f"Summary: 3\n\n"
+            f"Summary: 3\n"
+            f"OSCE: 1\n\n"
             f"يرجع العداد غداً."
         )
         return False
@@ -494,7 +673,13 @@ def increment_daily_usage(user_data: dict, kind: str) -> None:
 # OPENROUTER API (OPTIMIZED WITH aiohttp)
 # =============================================================================
 async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: int = 4096) -> str:
+    global _ACTIVE_AI_JOBS, _WAITING_AI_JOBS
+    async with _AI_QUEUE_LOCK:
+        _WAITING_AI_JOBS += 1
     async with _GEMINI_SEMAPHORE:
+        async with _AI_QUEUE_LOCK:
+            _WAITING_AI_JOBS = max(0, _WAITING_AI_JOBS - 1)
+            _ACTIVE_AI_JOBS += 1
         payload = {
             "model": GEMINI_MODEL_NAME,
             "messages": [{"role": "user", "content": prompt}],
@@ -522,6 +707,9 @@ async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: 
         except Exception as e:
             print(f"❌ [OpenRouter] UNKNOWN ERROR: {str(e)}")
             raise e
+        finally:
+            async with _AI_QUEUE_LOCK:
+                _ACTIVE_AI_JOBS = max(0, _ACTIVE_AI_JOBS - 1)
 
 
 # =============================================================================
@@ -592,7 +780,7 @@ SUMMARY_PROMPTS = {
 
 
 def extract_json_array(raw: str) -> Optional[list]:
-    """Improved JSON extraction: strips markdown code fences, uses correct regex."""
+    """Extract JSON array safely from AI response."""
     raw = (raw or "").strip()
 
     try:
@@ -747,6 +935,117 @@ async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
 
 
 # =============================================================================
+# OSCE SIMULATOR V1
+# =============================================================================
+def extract_json_object(raw: str) -> Optional[dict]:
+    raw = (raw or "").strip().replace("```json", "").replace("```", "").strip()
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+async def generate_osce_case(text: str) -> dict:
+    source = text[:MAX_TEXT_CHARS_FOR_AI]
+    prompt = f"""
+Educational OSCE simulation only. Create ONE realistic OSCE station from the source lecture.
+Return valid JSON object only, no markdown.
+Schema:
+{{
+  "station_title": "...",
+  "patient_role": "patient or relative",
+  "opening_statement": "A short first sentence the patient says when greeted, without diagnosis",
+  "hidden_diagnosis": "...",
+  "history": {{"presenting_complaint":"...", "hpi":"...", "pmh":"...", "medications":"...", "allergies":"...", "family_social":"...", "ob_gyn_or_system_specific":"..."}},
+  "examination": "Findings only if student asks for examination",
+  "labs": "Lab results only if student asks for labs/investigations",
+  "imaging": "Imaging or scan findings only if student asks for imaging",
+  "management_expected": "Expected management points",
+  "red_flags": ["..."],
+  "mark_scheme": ["...", "..."]
+}}
+Rules: Do not reveal diagnosis in opening_statement. Make the case medically coherent and exam focused.
+SOURCE TEXT:
+{source}
+"""
+    raw = await call_gemini(prompt, temperature=0.25, max_output_tokens=4096)
+    parsed = extract_json_object(raw)
+    if not parsed:
+        return {
+            "station_title": "OSCE Station",
+            "patient_role": "patient",
+            "opening_statement": "Doctor, I am worried about my symptoms.",
+            "hidden_diagnosis": "Not specified",
+            "history": {"presenting_complaint": "Symptoms based on the lecture", "hpi": "Ask focused questions to reveal more."},
+            "examination": "No examination data generated.",
+            "labs": "No lab data generated.",
+            "imaging": "No imaging data generated.",
+            "management_expected": "Provide appropriate assessment and management.",
+            "red_flags": [],
+            "mark_scheme": []
+        }
+    return parsed
+
+async def osce_patient_reply(session: dict, student_message: str) -> str:
+    case = session.get("case", {})
+    history = session.get("history", [])[-12:]
+    prompt = f"""
+You are role-playing as an OSCE patient for medical student training.
+IMPORTANT RULES:
+- Reply ONLY as the patient/relative, not as a teacher.
+- Do NOT reveal the hidden diagnosis unless the student explicitly explains it at the end.
+- Do NOT volunteer examination, lab, imaging, or management information unless the student asks for that category.
+- If asked for examination/labs/imaging, provide only the prepared findings from the case.
+- Keep answers realistic, short, and natural.
+- No hints. No differential diagnosis. No teaching unless OSCE is ended.
+
+CASE JSON:
+{json.dumps(case, ensure_ascii=False)}
+
+RECENT CHAT:
+{json.dumps(history, ensure_ascii=False)}
+
+STUDENT MESSAGE:
+{student_message}
+
+Patient reply:
+"""
+    return await call_gemini(prompt, temperature=0.35, max_output_tokens=900)
+
+async def osce_examiner_feedback(session: dict) -> str:
+    case = session.get("case", {})
+    history = session.get("history", [])
+    prompt = f"""
+You are an OSCE examiner. Evaluate the student's performance based on the case and chat.
+Give concise structured feedback in Arabic if the chat is Arabic, otherwise English.
+Include:
+- Overall score /100
+- History score /25
+- Examination score /20
+- Investigations score /20
+- Diagnosis & reasoning /20
+- Management & counseling /15
+- Missed key questions
+- Missed red flags
+- What to improve next time
+
+CASE:
+{json.dumps(case, ensure_ascii=False)}
+
+CHAT:
+{json.dumps(history, ensure_ascii=False)}
+"""
+    return await call_gemini(prompt, temperature=0.2, max_output_tokens=2000)
+
+# =============================================================================
 # KEYBOARDS
 # =============================================================================
 def lang_keyboard() -> InlineKeyboardMarkup:
@@ -756,27 +1055,14 @@ def lang_keyboard() -> InlineKeyboardMarkup:
     ])
 
 def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
-    """Main academy menu. Existing quiz/summary flows are preserved."""
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📝 بنك الأسئلة", callback_data="mode:quiz"),
-            InlineKeyboardButton("📚 الملخصات", callback_data="mode:summary"),
-        ],
-        [
-            InlineKeyboardButton("👨‍⚕️ محاكي OSCE", callback_data="academy:osce"),
-        ],
-        [
-            InlineKeyboardButton("📊 تقدمي و XP", callback_data="academy:progress"),
-            InlineKeyboardButton("🔥 الستريك", callback_data="academy:streak"),
-        ],
-        [
-            InlineKeyboardButton("🏆 لوحة الصدارة", callback_data="academy:leaderboard"),
-            InlineKeyboardButton("💎 الاشتراك", callback_data="academy:payment"),
-        ],
-        [
-            InlineKeyboardButton("📞 الدعم", callback_data="back:support"),
-            InlineKeyboardButton("🌐 اللغة", callback_data="academy:language"),
-        ],
+        [InlineKeyboardButton(t(user_data, "mode_quiz"), callback_data="mode:quiz"),
+         InlineKeyboardButton(t(user_data, "mode_summary"), callback_data="mode:summary")],
+        [InlineKeyboardButton(t(user_data, "mode_osce"), callback_data="mode:osce")],
+        [InlineKeyboardButton(t(user_data, "mode_progress"), callback_data="panel:progress"),
+         InlineKeyboardButton(t(user_data, "mode_leaderboard"), callback_data="panel:leaderboard")],
+        [InlineKeyboardButton(t(user_data, "mode_subscription"), callback_data="panel:subscription"),
+         InlineKeyboardButton("📞 الدعم", callback_data="back:support")],
     ])
 
 def summary_style_keyboard(user_data: dict) -> InlineKeyboardMarkup:
@@ -828,6 +1114,44 @@ def review_keyboard(current: int, total: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([buttons])
 
 
+def osce_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🩺 Examination", callback_data="osce:exam"),
+         InlineKeyboardButton("🧪 Labs", callback_data="osce:labs")],
+        [InlineKeyboardButton("🩻 Imaging", callback_data="osce:imaging"),
+         InlineKeyboardButton("✅ End OSCE", callback_data="osce:end")],
+        [InlineKeyboardButton("⬅️ Main Menu", callback_data="back:mode")],
+    ])
+
+def main_menu_text(user_data: dict) -> str:
+    lang = get_lang(user_data)
+    if lang == "ar":
+        return (
+            "🩺 MedMCQ AI Academy\n"
+            "━━━━━━━━━━━━━━\n"
+            "منصتك الذكية للتدريب الطبي\n\n"
+            "اختر الخدمة التي تريدها:\n"
+            "📝 أسئلة تفاعلية من محاضراتك\n"
+            "📚 ملخصات طبية منظمة\n"
+            "🎭 محاكي OSCE ذكي\n"
+            "📊 نقاط ومستويات وستريك\n"
+            "🏆 لوحة الصدارة\n"
+            "💎 الاشتراك والدفع"
+        )
+    return (
+        "🩺 MedMCQ AI Academy\n"
+        "━━━━━━━━━━━━━━\n"
+        "Your smart medical learning platform.\n\n"
+        "Choose a service:\n"
+        "📝 Interactive quizzes from your lectures\n"
+        "📚 Structured AI summaries\n"
+        "🎭 Smart OSCE simulator\n"
+        "📊 XP, levels, and streak\n"
+        "🏆 Leaderboard\n"
+        "💎 Subscription"
+    )
+
+
 # =============================================================================
 # FORMATTING
 # =============================================================================
@@ -875,7 +1199,13 @@ async def send_final_score(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
     pct = round(score/total*100) if total else 0
     wrong = session.get("wrong", [])
     update_stats(context.user_data, score, total)
+    # XP formula: participation + correct answers + high-score bonus.
+    xp_points = 25 + (score * 10) + (20 if pct >= 80 else 0)
+    progress = await db_add_xp(chat_id, xp_points, f"Quiz completed ({score}/{total})", correct=score, total=total, quiz_done=True)
     text = t(context.user_data, "complete", score=score, total=total, pct=pct)
+    text += f"\n\n⭐ +{xp_points} XP | 🎖 Level {progress.get('level', 1)} | 🔥 Streak {progress.get('streak', 0)}"
+    if progress.get("leveled_up"):
+        text += "\n🎉 Level up! ممتاز، استمر."
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=post_quiz_keyboard(context.user_data, bool(wrong)))
     context.user_data["review_pool"] = wrong
     context.user_data.pop("session", None)
@@ -885,19 +1215,21 @@ async def send_final_score(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
 # COMMANDS HANDLERS
 # =============================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "🩺 MedMCQ AI Academy\n\n"
-        "🎓 منصة ذكية لطلبة الطب\n"
-        "━━━━━━━━━━━━━━\n"
-        "📚 ملخصات من ملفاتك\n"
-        "📝 أسئلة تفاعلية Basic / Cases / Challenge\n"
-        "👨‍⚕️ محاكي OSCE ذكي\n"
-        "🔥 ستريك + XP + مستويات\n"
-        "🏆 لوحة صدارة أسبوعية وشهرية\n"
-        "💎 اشتراكات وحدود استخدام\n"
-        "━━━━━━━━━━━━━━\n"
-        "اختر لغتك للبدء:"
-    )
+    await db_register_user(update.effective_user)
+    welcome_text = """
+🩺 MedMCQ AI Academy
+━━━━━━━━━━━━━━
+🎓 Smart Medical Learning Platform
+
+📚 AI Summaries
+🧠 Smart Quizzes
+🎭 Interactive OSCE Cases
+🔥 Streak, XP & Levels
+🏆 Leaderboard
+💎 Subscription
+
+اختر لغتك للبدء
+"""
     await update.message.reply_text(welcome_text, reply_markup=lang_keyboard())
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -940,6 +1272,10 @@ async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
+async def osce_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["pending_mode"] = "osce"
+    await update.message.reply_text(t(context.user_data, "mode_osce_prompt"))
+
 async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id not in ADMIN_USER_IDS:
@@ -961,19 +1297,21 @@ async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, lang = query.data.split(":", 1)
     if lang not in SUPPORTED_LANGS: return
     context.user_data["lang"] = lang
-    await query.edit_message_text(t(context.user_data, "home_title"), reply_markup=mode_keyboard(context.user_data))
+    await query.edit_message_text(main_menu_text(context.user_data), reply_markup=mode_keyboard(context.user_data))
 
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     _, mode = query.data.split(":", 1)
-    if mode not in ("quiz", "summary"): return
+    if mode not in ("quiz", "summary", "osce"): return
     context.user_data["pending_mode"] = mode
     await query.edit_message_reply_markup(reply_markup=None)
     if mode == "summary":
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "summary_style_prompt"), reply_markup=summary_style_keyboard(context.user_data))
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "summary_style_prompt") + "\n\n" + ai_queue_status_text(), reply_markup=summary_style_keyboard(context.user_data))
+    elif mode == "osce":
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "mode_osce_prompt") + "\n\n" + ai_queue_status_text())
     else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "mode_quiz_prompt"))
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=t(context.user_data, "mode_quiz_prompt") + "\n\n" + ai_queue_status_text())
 
 async def summary_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1160,58 +1498,120 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def academy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action = query.data.split(":", 1)[1]
+    await db_register_user(update.effective_user)
+    _, action = query.data.split(":", 1)
 
-    if action == "osce":
-        await query.edit_message_text(
-            t(context.user_data, "osce_intro"),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 أرسل ملف لتجهيز حالة لاحقاً", callback_data="mode:quiz")],
-                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
-            ])
+    if action == "progress":
+        user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+        p = await db_get_progress(user_id)
+        total = int(p.get("total") or 0)
+        accuracy = round(int(p.get("correct") or 0) / total * 100) if total else 0
+        msg = (
+            "📊 تقدمي ونقاطي\n\n"
+            f"⭐ XP: {p.get('xp', 0)}\n"
+            f"🎖 Level: {p.get('level', 1)}\n"
+            f"🔥 Streak: {p.get('streak', 0)} يوم\n"
+            f"📝 Quizzes: {p.get('quizzes', 0)}\n"
+            f"🎯 Accuracy: {accuracy}%\n"
+            f"🎭 OSCE completed: {p.get('osce_done', 0)}\n"
+            f"📚 Summaries: {p.get('summaries_done', 0)}\n\n"
+            "كل اختبار/ملخص/OSCE يعطيك XP ويرفع مستواك."
         )
-
-    elif action == "progress":
         await query.edit_message_text(
-            t(context.user_data, "progress_text"),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 إحصائياتي الحالية", callback_data="review:stats")],
-                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
-            ])
+            msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]])
         )
 
     elif action == "leaderboard":
+        rows = await db_get_leaderboard(10)
+        if not rows:
+            body = "لا توجد نتائج بعد. كن أول طالب يدخل لوحة الصدارة."
+        else:
+            lines = []
+            medals = ["🥇", "🥈", "🥉"]
+            for i, r in enumerate(rows, 1):
+                name = r.get("full_name") or r.get("username") or "Student"
+                prefix = medals[i-1] if i <= 3 else f"{i}."
+                lines.append(f"{prefix} {name} — ⭐ {r.get('xp', 0)} XP | 🎖 L{r.get('level', 1)} | 🔥 {r.get('streak', 0)}")
+            body = "\n".join(lines)
+
         await query.edit_message_text(
-            t(context.user_data, "leaderboard_text"),
+            "🏆 لوحة الصدارة\n\n" + body,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]])
+        )
+
+    elif action == "subscription":
+        await query.edit_message_text(
+            "💎 الاشتراك والدفع\n\n"
+            "Free:\n"
+            "• Basic محدود\n• Summary محدود\n• OSCE يومي محدود\n\n"
+            "Premium قريباً:\n"
+            "• حدود أعلى\n• أولوية في الطابور\n• OSCE أكثر\n• Leaderboard badges\n\n"
+            "هذه الخانة جاهزة للتعديل حسب طريقة الدفع التي تختارها لاحقاً.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
+                [InlineKeyboardButton("🧾 طلب تفعيل / إرسال إثبات", callback_data="payment:request")],
+                [InlineKeyboardButton("📞 الدعم", callback_data="back:support")],
+                [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]
             ])
         )
 
-    elif action == "streak":
-        await query.edit_message_text(
-            t(context.user_data, "streak_text"),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📝 ابدأ اختبار", callback_data="mode:quiz")],
-                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
-            ])
+async def osce_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = context.user_data.get("osce_session")
+    if not session:
+        await query.edit_message_text(t(context.user_data, "osce_no_session"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
+        return
+    action = query.data.split(":", 1)[1]
+    case = session.get("case", {})
+    if action == "exam":
+        msg = "🩺 Examination findings:\n\n" + str(case.get("examination", "No examination findings available."))
+        session.setdefault("history", []).append({"student": "Asked for examination", "patient": msg})
+        await query.edit_message_text(msg, reply_markup=osce_keyboard())
+    elif action == "labs":
+        msg = "🧪 Laboratory / investigation results:\n\n" + str(case.get("labs", "No lab results available."))
+        session.setdefault("history", []).append({"student": "Asked for labs", "patient": msg})
+        await query.edit_message_text(msg, reply_markup=osce_keyboard())
+    elif action == "imaging":
+        msg = "🩻 Imaging findings:\n\n" + str(case.get("imaging", "No imaging findings available."))
+        session.setdefault("history", []).append({"student": "Asked for imaging", "patient": msg})
+        await query.edit_message_text(msg, reply_markup=osce_keyboard())
+    elif action == "end":
+        await query.edit_message_text("⏳ Examiner is marking your OSCE...")
+        feedback = await osce_examiner_feedback(session)
+        context.user_data.pop("osce_session", None)
+        if update.effective_user:
+            progress = await db_add_xp(update.effective_user.id, 60, "OSCE completed", osce_done=True)
+            feedback += f"\n\n⭐ +60 XP | 🎖 Level {progress.get('level', 1)} | 🔥 Streak {progress.get('streak', 0)}"
+        chunks = [feedback[i:i+3900] for i in range(0, len(feedback), 3900)]
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "osce_finished"))
+        for chunk in chunks:
+            await context.bot.send_message(update.effective_chat.id, chunk)
+
+
+async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if user:
+        await db_register_user(user)
+        await db_create_payment_request(user.id, "User opened payment request")
+        await send_admin_log(
+            context,
+            f"💎 طلب اشتراك جديد\nUser ID: {user.id}\nName: {user.full_name}\nUsername: @{user.username if user.username else 'لا يوجد'}"
         )
-
-    elif action == "payment":
-        await query.edit_message_text(
-            t(context.user_data, "payment_text"),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📞 تواصل مع الدعم", callback_data="back:support")],
-                [InlineKeyboardButton("⬅️ رجوع للقائمة", callback_data="back:mode")]
-            ])
-        )
-
-    elif action == "language":
-        await query.edit_message_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
-
+    await query.edit_message_text(
+        "🧾 تم فتح طلب اشتراك مبدئي.\n\n"
+        "حالياً نظام الدفع في وضع التجهيز. عند تحديد طريقة الدفع سنفعّل التحقق التلقائي.\n\n"
+        "للتفعيل اليدوي الآن: اضغط الدعم وأرسل إثبات الدفع.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📞 الدعم", callback_data="back:support")],
+            [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]
+        ])
+    )
 
 # =============================================================================
 # BACK NAVIGATION & SUPPORT CALLBACKS
@@ -1225,7 +1625,7 @@ async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if target == "mode":
         await query.edit_message_text(
-            t(context.user_data, "home_title"),
+            main_menu_text(context.user_data),
             reply_markup=mode_keyboard(context.user_data)
         )
 
@@ -1358,6 +1758,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db_save_file(file_hash, doc.file_name or "document", len(raw_bytes), doc.mime_type or "", text)
 
         mode = context.user_data.get("pending_mode", "quiz")
+        if mode == "osce":
+            if not await check_daily_limit(update, context, "osce"):
+                return
+            await status.edit_text(t(context.user_data, "osce_generating"))
+            case = await generate_osce_case(text)
+            context.user_data["osce_session"] = {
+                "case": case,
+                "history": [],
+                "file_hash": file_hash,
+                "started_at": datetime.utcnow().isoformat(),
+            }
+            context.user_data.pop("pending_mode", None)
+            increment_daily_usage(context.user_data, "osce")
+            if user:
+                await db_add_xp(user.id, 10, "OSCE case started")
+            opening = str(case.get("opening_statement", "Doctor, I am worried about my symptoms."))
+            title = str(case.get("station_title", "OSCE Station"))
+            await status.edit_text(f"{t(context.user_data, 'osce_ready')}\n\n📌 {title}\n\n🧑‍🦱 Patient: {opening}", reply_markup=osce_keyboard())
+            return
+
         if mode == "summary":
             if not await check_daily_limit(update, context, "summary"):
                 return
@@ -1376,6 +1796,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(chunk)
                     
                 increment_daily_usage(context.user_data, "summary")
+                if user:
+                    progress = await db_add_xp(user.id, 15, "Summary generated", summary_done=True)
+                    await update.message.reply_text(f"⭐ +15 XP | 🎖 Level {progress.get('level', 1)} | 🔥 Streak {progress.get('streak', 0)}")
             else:
                 await update.message.reply_text(t(context.user_data, "summary_failed"))
             return
@@ -1403,6 +1826,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
+
+    osce_session = context.user_data.get("osce_session")
+    if osce_session:
+        lowered = (text or "").strip().lower()
+        if lowered in {"انهاء", "إنهاء", "end", "finish", "stop osce"}:
+            await update.message.reply_text("⏳ Examiner is marking your OSCE...")
+            feedback = await osce_examiner_feedback(osce_session)
+            context.user_data.pop("osce_session", None)
+            if user:
+                progress = await db_add_xp(user.id, 60, "OSCE completed", osce_done=True)
+                feedback += f"\n\n⭐ +60 XP | 🎖 Level {progress.get('level', 1)} | 🔥 Streak {progress.get('streak', 0)}"
+            await update.message.reply_text(t(context.user_data, "osce_finished"))
+            for chunk in [feedback[i:i+3900] for i in range(0, len(feedback), 3900)]:
+                await update.message.reply_text(chunk)
+            return
+        await update.message.chat.send_action(action="typing")
+        reply = await osce_patient_reply(osce_session, text)
+        osce_session.setdefault("history", []).append({"student": text, "patient": reply})
+        await update.message.reply_text(reply, reply_markup=osce_keyboard())
+        return
 
     support_type = context.user_data.get("awaiting_support_message")
     if support_type:
@@ -1451,6 +1894,7 @@ BOT_COMMANDS = [
     BotCommand("review", "Review mistakes"),
     BotCommand("language", "Change language"),
     BotCommand("support", "الدعم"),
+    BotCommand("osce", "Start OSCE mode"),
     BotCommand("testbot", "Admin test"),
 ]
 
@@ -1483,15 +1927,18 @@ def main():
     application.add_handler(CommandHandler("review", review_command))
     application.add_handler(CommandHandler("language", language_command))
     application.add_handler(CommandHandler("support", support_command))
+    application.add_handler(CommandHandler("osce", osce_command))
     application.add_handler(CommandHandler("testbot", testbot_command))
     application.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang:"))
     application.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
     application.add_handler(CallbackQueryHandler(summary_style_callback, pattern=r"^style:"))
-    application.add_handler(CallbackQueryHandler(academy_callback, pattern=r"^academy:"))
     application.add_handler(CallbackQueryHandler(level_callback, pattern=r"^level:"))
     application.add_handler(CallbackQueryHandler(count_callback, pattern=r"^count:"))
     application.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^ans:"))
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
+    application.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^panel:"))
+    application.add_handler(CallbackQueryHandler(osce_callback, pattern=r"^osce:"))
+    application.add_handler(CallbackQueryHandler(payment_callback, pattern=r"^payment:"))
     application.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
     application.add_handler(CallbackQueryHandler(back_callback, pattern=r"^back:"))
 
