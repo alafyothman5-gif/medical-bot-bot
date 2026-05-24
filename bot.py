@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 Smart Medical Assistant Bot - OpenRouter Paid Economical Edition
-+ OSCE SIMULATOR V3 (Advanced Clinical Edition with Timers, ICE, and Memory)
-+ Past Papers UI (Universities / Subjects)
-+ Admin Staging Pipeline & Vision API Integration
+OSCE SIMULATOR V4 (Step-by-Step Clinical Assessment)
+Past Papers UI (Universities / Subjects)
+Admin Staging Pipeline & Vision API Integration
 """
 
 import asyncio
@@ -47,6 +46,7 @@ except Exception:
 # =============================================================================
 # LOGGING & ENVIRONMENT
 # =============================================================================
+
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("medical_bot_openrouter")
 
@@ -75,6 +75,7 @@ def get_generation_lock(key: str) -> asyncio.Lock:
 # =============================================================================
 # TRANSLATIONS
 # =============================================================================
+
 SUPPORTED_LANGS = ("en", "ar")
 
 TRANSLATIONS = {
@@ -221,6 +222,7 @@ def t(user_data: dict, key: str, **kwargs) -> str:
 # =============================================================================
 # SQLITE CACHE & PROGRESS DB
 # =============================================================================
+
 _db_lock = asyncio.Lock()
 
 def _db_connect() -> sqlite3.Connection:
@@ -240,12 +242,12 @@ def init_db() -> None:
     cur.execute("CREATE TABLE IF NOT EXISTS user_progress (user_id INTEGER PRIMARY KEY, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1, streak INTEGER DEFAULT 0, last_activity_day TEXT, quizzes INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, total INTEGER DEFAULT 0, osce_done INTEGER DEFAULT 0, summaries_done INTEGER DEFAULT 0, updated_at TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS xp_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, points INTEGER, reason TEXT, created_at TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT DEFAULT 'pending', note TEXT, created_at TEXT)")
-    
-    # الجداول الإضافية لميزة الـ Past Papers والتجميع العشوائي
-    cur.execute("CREATE TABLE IF NOT EXISTS past_papers (id INTEGER PRIMARY KEY AUTOINCREMENT, uni TEXT NOT NULL, subject TEXT NOT NULL, questions_json TEXT NOT NULL, created_at TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS admin_staging (user_id INTEGER NOT NULL, uni TEXT NOT NULL, subject TEXT NOT NULL, raw_content TEXT NOT NULL, created_at TEXT)")
-    
-    conn.commit()
+
+    # الجداول الإضافية لميزة الـ Past Papers والتجميع العشوائي  
+    cur.execute("CREATE TABLE IF NOT EXISTS past_papers (id INTEGER PRIMARY KEY AUTOINCREMENT, uni TEXT NOT NULL, subject TEXT NOT NULL, questions_json TEXT NOT NULL, created_at TEXT)")  
+    cur.execute("CREATE TABLE IF NOT EXISTS admin_staging (user_id INTEGER NOT NULL, uni TEXT NOT NULL, subject TEXT NOT NULL, raw_content TEXT NOT NULL, created_at TEXT)")  
+      
+    conn.commit()  
     conn.close()
 
 async def db_get_file(file_hash: str) -> Optional[dict]:
@@ -340,32 +342,32 @@ async def db_add_xp(user_id: int, points: int, reason: str, correct: int = 0, to
                 conn.execute("INSERT OR IGNORE INTO user_progress(user_id, updated_at) VALUES(?, ?)", (user_id, now))
                 row = conn.execute("SELECT * FROM user_progress WHERE user_id=?", (user_id,)).fetchone()
 
-            old_xp = int(row["xp"] or 0)
-            old_level = int(row["level"] or 1)
-            last_day = row["last_activity_day"]
-            streak = int(row["streak"] or 0)
+            old_xp = int(row["xp"] or 0)  
+            old_level = int(row["level"] or 1)  
+            last_day = row["last_activity_day"]  
+            streak = int(row["streak"] or 0)  
 
-            if last_day != today:
-                try:
-                    prev = datetime.strptime(last_day, "%Y-%m-%d") if last_day else None
-                    if prev and (datetime.strptime(today, "%Y-%m-%d") - prev).days == 1:
-                        streak += 1
-                    else: streak = 1
-                except Exception: streak = 1
+            if last_day != today:  
+                try:  
+                    prev = datetime.strptime(last_day, "%Y-%m-%d") if last_day else None  
+                    if prev and (datetime.strptime(today, "%Y-%m-%d") - prev).days == 1:  
+                        streak += 1  
+                    else: streak = 1  
+                except Exception: streak = 1  
 
-            new_xp = old_xp + max(0, int(points))
-            new_level = calc_level(new_xp)
-            conn.execute(
-                "UPDATE user_progress SET xp=?, level=?, streak=?, last_activity_day=?, quizzes=quizzes+?, "
-                "correct=correct+?, total=total+?, osce_done=osce_done+?, summaries_done=summaries_done+?, updated_at=? WHERE user_id=?",
-                (new_xp, new_level, streak, today, 1 if quiz_done else 0, int(correct), int(total), 1 if osce_done else 0, 1 if summary_done else 0, now, user_id),
-            )
-            conn.execute("INSERT INTO xp_events(user_id, points, reason, created_at) VALUES(?,?,?,?)", (user_id, int(points), reason, now))
-            conn.commit()
-            out = dict(conn.execute("SELECT * FROM user_progress WHERE user_id=?", (user_id,)).fetchone())
-            conn.close()
-            out["leveled_up"] = new_level > old_level
-            return out
+            new_xp = old_xp + max(0, int(points))  
+            new_level = calc_level(new_xp)  
+            conn.execute(  
+                "UPDATE user_progress SET xp=?, level=?, streak=?, last_activity_day=?, quizzes=quizzes+?, "  
+                "correct=correct+?, total=total+?, osce_done=osce_done+?, summaries_done=summaries_done+?, updated_at=? WHERE user_id=?",  
+                (new_xp, new_level, streak, today, 1 if quiz_done else 0, int(correct), int(total), 1 if osce_done else 0, 1 if summary_done else 0, now, user_id),  
+            )  
+            conn.execute("INSERT INTO xp_events(user_id, points, reason, created_at) VALUES(?,?,?,?)", (user_id, int(points), reason, now))  
+            conn.commit()  
+            out = dict(conn.execute("SELECT * FROM user_progress WHERE user_id=?", (user_id,)).fetchone())  
+            conn.close()  
+            out["leveled_up"] = new_level > old_level  
+            return out  
         return await asyncio.to_thread(work)
 
 async def db_get_progress(user_id: int) -> dict:
@@ -413,18 +415,19 @@ async def cleanup_old_cache(days: int = 30) -> None:
             conn.close()
             return len(old_hashes)
         deleted = await asyncio.to_thread(work)
-    logger.info("Cleanup done. Deleted old files: %s", deleted)
+        logger.info("Cleanup done. Deleted old files: %s", deleted)
 
 # =============================================================================
 # HELPERS & USAGE LIMITS
 # =============================================================================
+
 user_last_request: Dict[int, float] = {}
 
 def sha256_bytes(data: bytes) -> str: return hashlib.sha256(data).hexdigest()
 
 def escape_md(text: object) -> str:
     value = "" if text is None else str(text)
-    for ch in ("*", "_", "`", "["): value = value.replace(ch, f"\\{ch}")
+    for ch in ("*", "_", "`", "["): value = value.replace(ch, f"\{ch}")
     return value
 
 def progress_bar(current: int, total: int, width: int = 12) -> str:
@@ -480,6 +483,7 @@ def increment_daily_usage(user_data: dict, kind: str) -> None:
 # =============================================================================
 # OPENROUTER API (AI ENGINE)
 # =============================================================================
+
 async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: int = 4096) -> str:
     global _ACTIVE_AI_JOBS, _WAITING_AI_JOBS
     if not OPENROUTER_API_KEY: raise Exception("OPENROUTER_API_KEY is missing.")
@@ -519,6 +523,7 @@ async def call_gemini_vision(image_bytes: bytes) -> str:
 # =============================================================================
 # TEXT EXTRACTION
 # =============================================================================
+
 def classify_document(mime: str, name: str) -> str:
     name = (name or "").lower()
     if name.endswith(".pdf"): return "pdf"
@@ -538,62 +543,9 @@ def extract_text(file_type: str, raw_bytes: bytes) -> str:
     return ""
 
 # =============================================================================
-# ADMIN STAGING COMMANDS (THE PIPELINE)
-# =============================================================================
-async def stage_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
-        return await update.message.reply_text(f"⛔ عذراً، هذا الأمر للإدارة فقط!\n\nرقم הـ ID الخاص بك هو:\n`{update.effective_user.id}`", parse_mode="Markdown")
-    if len(context.args) < 2: return await update.message.reply_text("استخدم: /stage_start [uni] [subject]")
-    context.user_data["active_staging"] = {"uni": context.args[0].lower(), "subject": context.args[1].lower()}
-    await update.message.reply_text("📥 **بدأ التجميع!** أي نص/صورة/ملف ترسله سيُخزن للمراجعة.\nللتصدير: /stage_dump", parse_mode="Markdown")
-
-async def stage_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_USER_IDS or not context.user_data.get("active_staging"): return
-    st = context.user_data["active_staging"]
-    uni, subject = st["uni"], st["subject"]
-    
-    def get_dump():
-        conn = _db_connect()
-        rows = conn.execute("SELECT raw_content FROM admin_staging WHERE user_id=? AND uni=? AND subject=? ORDER BY created_at ASC", (user_id, uni, subject)).fetchall()
-        content = [r["raw_content"] for r in rows]
-        conn.execute("DELETE FROM admin_staging WHERE user_id=? AND uni=? AND subject=?", (user_id, uni, subject))
-        conn.commit()
-        conn.close()
-        return content
-
-    async with _db_lock:
-        content_list = await asyncio.to_thread(get_dump)
-        
-    if not content_list: return await update.message.reply_text("المستودع فارغ.")
-    
-    txt = "\n\n========================================\n".join(content_list)
-    f = io.BytesIO(txt.encode('utf-8')); f.name = f"dump_{uni}_{subject}.txt"
-    context.user_data.pop("active_staging", None)
-    await context.bot.send_document(update.effective_chat.id, f, caption="📦 المستودع تم تصديره وتفريغه. قم بتنظيفه بـ ChatGPT ثم استخدم /upload_final")
-
-async def upload_final_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS: return
-    if len(context.args) < 2: return await update.message.reply_text("استخدم: /upload_final [uni] [subject] وارفق الـ JSON")
-    context.user_data["pending_final"] = {"uni": context.args[0].lower(), "subject": context.args[1].lower()}
-    await update.message.reply_text("🔄 مستعد. أرسل الآن ملف الـ JSON النهائي لرفعه للطلبة.")
-
-async def handle_admin_acc(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    st = context.user_data.get("active_staging")
-    if not st: return
-    async with _db_lock:
-        def work():
-            conn = _db_connect()
-            conn.execute("INSERT INTO admin_staging (user_id, uni, subject, raw_content, created_at) VALUES (?, ?, ?, ?, ?)",
-                         (update.effective_user.id, st["uni"], st["subject"], text, datetime.utcnow().isoformat()))
-            conn.commit()
-            conn.close()
-        await asyncio.to_thread(work)
-    await update.message.reply_text("✅ [المستودع المؤقت]: تم التقاط وحفظ المحتوى بنجاح.")
-
-# =============================================================================
 # QUIZ & SUMMARY LOGIC
 # =============================================================================
+
 LEVEL_LIMITS = {"basic": 50, "cases": 5, "challenge": 2}
 BASIC_COUNTS = (5, 10, 20, 30, 40)
 QUESTION_SCHEMA = """Return valid JSON array only. No markdown. Each item must be: { "question": "...", "options": {"A":"...", "B":"...", "C":"...", "D":"...", "E":"..."}, "correct": "A", "explanation": "..." } Exactly 5 options A-E. correct is one of A-E."""
@@ -615,8 +567,8 @@ def extract_json_array(raw: str) -> Optional[list]:
     raw = (raw or "").strip()
     try: return json.loads(raw) if isinstance(json.loads(raw), list) else None
     except Exception: pass
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+    raw = raw.replace("json", "").replace("", "").strip()
+    match = re.search(r"[.*]", raw, flags=re.DOTALL)
     if match:
         try: return json.loads(match.group(0)) if isinstance(json.loads(match.group(0)), list) else None
         except Exception: pass
@@ -682,277 +634,705 @@ async def get_or_create_summary(file_hash: str, text: str, style: str) -> str:
         return summary
 
 # =============================================================================
-# OSCE SIMULATOR V3
+# OSCE SIMULATOR V4 — خطوة بخطوة (Step-by-Step Clinical Assessment)
 # =============================================================================
-OSCE_STATION_DURATION_SECONDS = 480
-OSCE_WARNING_AT_SECONDS = 120
-OSCE_MAX_HISTORY_FOR_AI = 12
 
-def normalize_osce_case(case: dict) -> dict:
-    if not isinstance(case, dict): case = {}
-    history = case.get("history") if isinstance(case.get("history"), dict) else {}
-    return {
-        "station_title": _safe_short_text(case.get("station_title"), "Clinical OSCE Station", 80),
-        "patient_role": _safe_short_text(case.get("patient_role"), "patient", 40),
-        "patient_mood": str(case.get("patient_mood") or "anxious but cooperative").strip(),
-        "patient_language": str(case.get("patient_language") or "arabic").strip().lower(),
-        "opening_statement": _safe_short_text(case.get("opening_statement"), "يا دكتور، أنا تعبان جداً ومحتاج مساعدتك.", 120),
-        "hidden_diagnosis": str(case.get("hidden_diagnosis") or "Not specified").strip(),
-        "history": {
-            "presenting_complaint": str(history.get("presenting_complaint") or "Symptom related to lecture.").strip(),
-            "hpi": str(history.get("hpi") or "Onset, character, radiation, timing, severity, associated symptoms.").strip(),
-            "pmh": str(history.get("pmh") or "No major past medical history.").strip(),
-            "medications": str(history.get("medications") or "No regular medications.").strip(),
-            "allergies": str(history.get("allergies") or "NKDA").strip(),
-            "family_social": str(history.get("family_social") or "Non-smoker, no alcohol, no relevant family history.").strip(),
-            "ice": str(history.get("ice") or "Patient fears it might be serious. Wants reassurance.").strip(),
-            "review_of_systems": str(history.get("review_of_systems") or "No other significant symptoms.").strip(),
-        },
-        "vitals": str(case.get("vitals") or "BP: 130/85 mmHg | HR: 92 bpm | RR: 18 | Temp: 37.2°C | SpO2: 97%").strip(),
-        "examination": str(case.get("examination") or "Focused examination findings not available unless asked.").strip(),
-        "labs": str(case.get("labs") or "Laboratory results not available unless ordered.").strip(),
-        "imaging": str(case.get("imaging") or "No imaging results available.").strip(),
-        "management_expected": str(case.get("management_expected") or "Safe systematic management approach.").strip(),
-        "red_flags": case.get("red_flags") if isinstance(case.get("red_flags"), list) else ["Hemodynamic instability", "Altered consciousness"],
-        "mark_scheme": case.get("mark_scheme") if isinstance(case.get("mark_scheme"), list) else ["Introduced themselves", "Asked about onset", "Asked about ICE", "Requested examination", "Ordered investigations", "Stated diagnosis"],
-    }
+OSCE_V4_DIFFICULTY = "medium-hard"
 
-async def generate_osce_case(text: str, max_chars: int = 12000) -> dict:
-    prompt = f"""You are a Senior Medical Examiner designing a realistic OSCE station for medical students. Return valid JSON object ONLY. No markdown.
-STRICT DESIGN RULES:
-1. 'opening_statement' = ONE sentence, layperson language, symptom ONLY. Max 12 words. NO medical jargon.
-2. 'patient_mood' must be specific: e.g., "in severe pain", "anxious", "defensive".
-3. 'patient_language' = "arabic" or "english".
-4. 'ice' MUST be specific: "Thinks it's cancer, scared of surgery, wants painkillers".
-5. 'mark_scheme' MUST have 10-14 specific checkable actions.
-JSON Schema:
-{{"station_title": "Neutral title", "patient_role": "patient or relative", "patient_mood": "specific mood", "patient_language": "arabic or english", "opening_statement": "Single natural sentence", "hidden_diagnosis": "Exact medical diagnosis", "history": {{"presenting_complaint": "One sentence summary", "hpi": "Full SOCRATES", "pmh": "Past history", "medications": "Meds and doses", "allergies": "Drug allergies", "family_social": "Smoking, alcohol, family", "ice": "Ideas, Concerns, Expectations", "review_of_systems": "Relevant ROS"}}, "vitals": "Specific numbers", "examination": "Specific findings", "labs": "Specific values", "imaging": "Specific findings", "management_expected": "Step-by-step management", "red_flags": ["list red flags"], "mark_scheme": ["Introduced self", "Asked about X", "Checked Y", "..."]}}
-SOURCE TEXT:
-{text[:max_chars]}"""
-    raw = await call_gemini(prompt, temperature=0.18, max_output_tokens=4096)
-    parsed = extract_json_object(raw)
-    return normalize_osce_case(parsed or {})
+OSCE_V4_PHASE_TIME = {
+    "diagnosis":   120,
+    "management":  150,
+    "workup":      180,
+}
 
-async def detect_osce_intent_ai(student_message: str, conversation_context: str) -> str:
-    prompt = f"""Classify the medical student's message into EXACTLY ONE of these intents:
-- "history"    → asking about symptoms, past history, medications, social
-- "ice"        → asking about patient's ideas, concerns, expectations, feelings
-- "exam"       → requesting physical examination or vital signs
-- "labs"       → requesting blood/urine tests
-- "imaging"    → requesting X-ray, ultrasound, CT, MRI
-- "diagnosis"  → stating or asking for the diagnosis
-- "management" → asking about or stating treatment, drugs, surgery, plan
-Context: {conversation_context}
-Student: "{student_message}"
-Reply with ONE word only."""
+OSCE_V4_LAB_OPTIONS = [
+    ("CBC",          "🩸 CBC — صورة الدم الكاملة"),
+    ("CMP",          "🧪 CMP — كيمياء الدم الشاملة"),
+    ("LFT",          "🫀 LFT — وظائف الكبد"),
+    ("COAG",         "🩺 Coagulation — تخثر الدم"),
+    ("CARDIAC",      "❤️ Troponin / BNP — قلب"),
+    ("THYROID",      "🦋 TSH / T4 — غدة درقية"),
+    ("URINE",        "💛 Urinalysis — تحليل بول"),
+    ("CULTURE",      "🦠 Culture & Sensitivity — مزرعة"),
+    ("LIPASE",       "🫁 Lipase / Amylase — بنكرياس"),
+    ("ABG",          "💨 ABG — غازات الدم"),
+]
+
+OSCE_V4_IMAGING_OPTIONS = [
+    ("CXR",          "🫁 Chest X-Ray — صورة صدر"),
+    ("AXR",          "🩻 Abdominal X-Ray — صورة بطن"),
+    ("USS_ABD",      "🔊 Ultrasound Abdomen — سونار البطن"),
+    ("USS_PELV",     "🔊 Ultrasound Pelvis — سونار الحوض"),
+    ("ECHO",         "❤️ Echocardiogram — صدى القلب"),
+    ("CT_HEAD",      "🧠 CT Head — سي تي رأس"),
+    ("CT_CHEST",     "🫁 CT Chest — سي تي صدر"),
+    ("CT_ABD",       "🩻 CT Abdomen/Pelvis — سي تي بطن"),
+    ("MRI_BRAIN",    "🧲 MRI Brain — رنين مغناطيسي دماغ"),
+    ("MRI_SPINE",    "🦴 MRI Spine — رنين مغناطيسي عمود"),
+]
+
+OSCE_V4_CASE_PROMPT = """
+You are a Senior Medical Examiner. Generate ONE realistic, medium-to-hard OSCE clinical case.
+Difficulty: {difficulty} — avoid trivial presentations. Use atypical features or uncommon complications.
+
+Return ONLY valid JSON (no markdown, no explanation):
+
+{{
+  "station_title": "Short neutral title (e.g., 'Acute Abdomen in a Young Female')",
+  "case_vignette": "3-5 sentence clinical scenario: patient age, sex, chief complaint, duration, key HPI details, relevant PMH, vital signs, relevant physical exam findings. Write like a real exam question.",
+  "hidden_diagnosis": "Exact medical diagnosis",
+  "differential_diagnoses": ["Most likely", "2nd", "3rd"],
+  "key_discriminating_features": "1-2 sentences: what features point to the correct diagnosis",
+  "ideal_management": "Step-by-step management: immediate stabilization, investigations, treatment, disposition. Be specific.",
+  "labs": {{
+    "CBC":     "Result text or 'Normal'",
+    "CMP":     "Result text or 'Normal'",
+    "LFT":     "Result text or 'Normal'",
+    "COAG":    "Result text or 'Normal'",
+    "CARDIAC": "Result text or 'Normal'",
+    "THYROID": "Result text or 'Normal'",
+    "URINE":   "Result text or 'Normal'",
+    "CULTURE": "Result text or 'Pending'",
+    "LIPASE":  "Result text or 'Normal'",
+    "ABG":     "Result text or 'Normal'"
+  }},
+  "imaging": {{
+    "CXR":      "Findings or 'No acute pathology'",
+    "AXR":      "Findings or 'No acute pathology'",
+    "USS_ABD":  "Findings or 'No acute pathology'",
+    "USS_PELV": "Findings or 'No acute pathology'",
+    "ECHO":     "Findings or 'No significant abnormality'",
+    "CT_HEAD":  "Findings or 'No intracranial pathology'",
+    "CT_CHEST": "Findings or 'No acute pathology'",
+    "CT_ABD":   "Findings or 'No acute pathology'",
+    "MRI_BRAIN":"Findings or 'No significant abnormality'",
+    "MRI_SPINE":"Findings or 'No significant abnormality'"
+  }},
+  "key_investigations": ["List the 3-5 most important investigations to order for this case"],
+  "management_mark_scheme": [
+    "Immediate action 1",
+    "Immediate action 2",
+    "Investigation ordered",
+    "Treatment given",
+    "Disposition/consult"
+  ],
+  "teaching_pearl": "One high-yield clinical pearl about this case"
+}}
+
+SOURCE TEXT (lecture/notes to base the case on):
+{text}
+"""
+
+async def generate_osce_v4_case(text: str, max_chars: int = 12000) -> dict:
+    prompt = OSCE_V4_CASE_PROMPT.format(
+        difficulty=OSCE_V4_DIFFICULTY,
+        text=text[:max_chars]
+    )
+    raw = await call_gemini(prompt, temperature=0.2, max_output_tokens=4096)
+    parsed = _extract_json_object_v4(raw)
+    return _normalize_osce_v4_case(parsed or {})
+
+
+def _extract_json_object_v4(raw: str) -> Optional[dict]:
+    raw = (raw or "").strip().replace("```json", "").replace("```", "").strip()
     try:
-        raw = await call_gemini(prompt, temperature=0.0, max_output_tokens=10)
-        intent = raw.strip().lower().strip('"').strip("'")
-        valid = {"history", "ice", "exam", "labs", "imaging", "diagnosis", "management"}
-        return intent if intent in valid else "history"
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
     except Exception:
-        return _detect_intent_fallback(student_message)
-
-def _detect_intent_fallback(text: str) -> str:
-    tmsg = (text or "").lower()
-    if any(w in tmsg for w in ["examination", "examine", "physical", "vital", "فحص", "افحص", "كشف", "ضغط", "نبض"]): return "exam"
-    if any(w in tmsg for w in ["lab", "test", "cbc", "blood", "تحليل", "تحاليل", "دم", "بول"]): return "labs"
-    if any(w in tmsg for w in ["imaging", "ultrasound", "scan", "xray", "ct", "mri", "تصوير", "سونار", "اشعة"]): return "imaging"
-    if any(w in tmsg for w in ["diagnosis", "تشخيص", "شنو عنده"]): return "diagnosis"
-    if any(w in tmsg for w in ["management", "treatment", "plan", "drug", "علاج", "دواء", "خطة"]): return "management"
-    if any(w in tmsg for w in ["feel", "think", "worry", "fear", "خايف", "قلقان", "تتوقع"]): return "ice"
-    return "history"
-
-def init_mark_tracker(mark_scheme: list) -> dict: return {"items": {item: False for item in mark_scheme}, "ice_asked": False, "redflags_checked": False}
-
-async def update_mark_tracker(tracker: dict, student_message: str, mark_scheme: list) -> list:
-    unchecked = [item for item, done in tracker["items"].items() if not done]
-    if not unchecked: return []
-    prompt = f'A student said: "{student_message}"\nWhich OSCE mark scheme items did they address? Return JSON array of matching items ONLY.\nItems: {json.dumps(unchecked, ensure_ascii=False)}'
-    try:
-        raw = await call_gemini(prompt, temperature=0.0, max_output_tokens=300)
-        matched = json.loads(raw.strip().replace("```json", "").replace("```", "").strip())
-        newly_checked = []
-        if isinstance(matched, list):
-            for item in matched:
-                if item in tracker["items"] and not tracker["items"][item]:
-                    tracker["items"][item] = True; newly_checked.append(item)
-        return newly_checked
-    except Exception: return []
-
-def get_tracker_summary(tracker: dict) -> dict:
-    items = tracker.get("items", {})
-    total = len(items); done = sum(1 for v in items.values() if v)
-    return {"total": total, "done": done, "missed": [k for k, v in items.items() if not v], "percentage": round(done / total * 100) if total else 0}
-
-def osce_prepared_response(session: dict, intent: str) -> Optional[str]:
-    case = session.get("case", {})
-    asked = session.setdefault("asked", {"exam": False, "labs": False, "imaging": False})
-    if intent == "exam":
-        if asked.get("exam"): return "🔄 [النظام]: لقد طلبت الفحص مسبقاً."
-        asked["exam"] = True; return f"🩺 [الفحص السريري]\n📊 حيويات: {case.get('vitals', 'N/A')}\n🔍 الفحص: {case.get('examination', 'No abnormal findings.')}"
-    if intent == "labs":
-        if asked.get("labs"): return "🔄 [النظام]: طلبت التحاليل سابقاً."
-        asked["labs"] = True; return f"🧪 [نتائج التحاليل]\n{case.get('labs', 'No labs available.')}"
-    if intent == "imaging":
-        if asked.get("imaging"): return "🔄 [النظام]: طلبت التصوير سابقاً."
-        asked["imaging"] = True; return f"🩻 [تقرير التصوير]\n{case.get('imaging', 'No imaging available.')}"
+        pass
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            pass
     return None
 
-async def osce_patient_reply(session: dict, student_message: str, intent: str) -> str:
+
+def _normalize_osce_v4_case(case: dict) -> dict:
+    def s(key, default=""): return str(case.get(key) or default).strip()
+    def lst(key, default=None): return case.get(key) if isinstance(case.get(key), list) else (default or [])
+    def dct(key): return case.get(key) if isinstance(case.get(key), dict) else {}
+
+    return {
+        "station_title":              s("station_title", "Clinical OSCE Station"),
+        "case_vignette":              s("case_vignette", "A patient presents with an acute complaint."),
+        "hidden_diagnosis":           s("hidden_diagnosis", "Diagnosis not specified"),
+        "differential_diagnoses":     lst("differential_diagnoses", ["Unknown"]),
+        "key_discriminating_features":s("key_discriminating_features", "See case details."),
+        "ideal_management":           s("ideal_management", "Assess, stabilize, investigate, treat."),
+        "labs":                       dct("labs"),
+        "imaging":                    dct("imaging"),
+        "key_investigations":         lst("key_investigations", []),
+        "management_mark_scheme":     lst("management_mark_scheme", ["Assess patient", "Order investigations", "Treat appropriately"]),
+        "teaching_pearl":             s("teaching_pearl", "Always consider the full differential."),
+    }
+
+
+def create_osce_v4_session(case: dict, file_hash: str) -> dict:
+    return {
+        "version":           4,
+        "case":              case,
+        "file_hash":         file_hash,
+        "phase":             "diagnosis",
+        "started_at_ts":     time.time(),
+        "phase_started_ts":  time.time(),
+        "phase_scores": {
+            "diagnosis":   None,
+            "management":  None,
+            "workup":      None,
+        },
+        "student_answers": {
+            "diagnosis":   "",
+            "management":  "",
+        },
+        "ordered_labs":    [],
+        "ordered_imaging": [],
+        "results_shown":   [],
+        "turn_count":      0,
+    }
+
+
+def _osce_v4_phase_remaining(session: dict) -> int:
+    phase = session.get("phase", "diagnosis")
+    limit = OSCE_V4_PHASE_TIME.get(phase, 120)
+    elapsed = time.time() - session.get("phase_started_ts", time.time())
+    return max(0, int(limit - elapsed))
+
+
+def _osce_v4_fmt_time(secs: int) -> str:
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
+
+async def _evaluate_osce_v4_diagnosis(student_answer: str, case: dict) -> dict:
+    prompt = f"""
+You are a medical examiner. Evaluate the student's diagnosis answer.
+
+Correct diagnosis: {case.get('hidden_diagnosis', '')}
+Differentials: {json.dumps(case.get('differential_diagnoses', []), ensure_ascii=False)}
+Key features: {case.get('key_discriminating_features', '')}
+
+Student answered: "{student_answer}"
+
+Return ONLY valid JSON:
+{{
+  "score": <0-100>,
+  "is_correct": <true/false>,
+  "feedback_ar": "2-3 جمل تقييم بالعربي: هل أصاب؟ ما الذي فاته؟ لماذا التشخيص الصحيح هو كذا؟",
+  "correct_diagnosis": "{case.get('hidden_diagnosis', '')}",
+  "key_point": "نقطة مهمة واحدة يجب أن يتذكرها الطالب"
+}}
+"""
+    raw = await call_gemini(prompt, temperature=0.1, max_output_tokens=500)
+    result = _extract_json_object_v4(raw)
+    if not result:
+        return {
+            "score": 50,
+            "is_correct": False,
+            "feedback_ar": "تعذّر التقييم التلقائي. التشخيص الصحيح: " + case.get('hidden_diagnosis', ''),
+            "correct_diagnosis": case.get('hidden_diagnosis', ''),
+            "key_point": case.get('key_discriminating_features', ''),
+        }
+    return result
+
+
+async def _evaluate_osce_v4_management(student_answer: str, case: dict) -> dict:
+    mark_scheme = case.get("management_mark_scheme", [])
+    prompt = f"""
+You are a medical examiner. Evaluate the student's management plan.
+
+Ideal management: {case.get('ideal_management', '')}
+Mark scheme: {json.dumps(mark_scheme, ensure_ascii=False)}
+
+Student answered: "{student_answer}"
+
+Return ONLY valid JSON:
+{{
+  "score": <0-100>,
+  "covered_points": ["list of mark scheme points the student covered"],
+  "missed_points": ["list of mark scheme points the student missed"],
+  "feedback_ar": "3-4 جمل تقييم بالعربي: ما الذي ذكره الطالب صح؟ ما الذي فاته؟",
+  "ideal_summary": "ملخص الخطة المثالية في جملتين"
+}}
+"""
+    raw = await call_gemini(prompt, temperature=0.1, max_output_tokens=600)
+    result = _extract_json_object_v4(raw)
+    if not result:
+        return {
+            "score": 50,
+            "covered_points": [],
+            "missed_points": mark_scheme,
+            "feedback_ar": "تعذّر التقييم. الخطة المثالية: " + case.get('ideal_management', ''),
+            "ideal_summary": case.get('ideal_management', '')[:200],
+        }
+    return result
+
+
+def _evaluate_osce_v4_workup(session: dict) -> dict:
     case = session.get("case", {})
-    history = session.get("history", [])[-OSCE_MAX_HISTORY_FOR_AI:]
-    mood = case.get("patient_mood", "anxious"); lang = case.get("patient_language", "arabic")
+    key_inv = set(case.get("key_investigations", []))
+    ordered = set(session.get("ordered_labs", []) + session.get("ordered_imaging", []))
 
-    if intent == "ice":
-        ice_data = case.get("history", {}).get("ice", "")
-        if ice_data:
-            session.setdefault("asked", {})["ice_asked"] = True
-            prompt = f"Patient in OSCE. Doctor asked about ICE. Your ICE (hidden): {ice_data}. Mood: {mood}. Express your ICE naturally as a patient. {'Arabic colloquial' if lang=='arabic' else 'English'}. Max 2 sentences."
-            try: return f"🧑‍🦱 {'المريض' if lang == 'arabic' else 'Patient'}: {_clean_patient_reply(await call_gemini(prompt, temperature=0.35, max_output_tokens=200))}"
-            except Exception: return "🧑‍🦱 المريض: أنا خايف يا دكتور... ما أعرف شنو عندي بالظبط."
+    def normalize(s): return s.upper().replace(" ", "").replace("-", "")
+    key_norm = {normalize(k) for k in key_inv}
+    ordered_norm = {normalize(o) for o in ordered}
+    hit = key_norm & ordered_norm
+    missed = key_norm - ordered_norm
 
-    lang_inst = "Respond ONLY in natural colloquial Arabic. No formal Arabic." if lang == "arabic" else "Respond ONLY in natural English."
-    prompt = f'Roleplay REAL patient in OSCE.\nRULES:\n1. Layperson. NO medical jargon.\n2. Mood: {mood}.\n3. Memory: Say "قلتلك" if repeating.\n4. Answer ONLY the specific part asked.\n5. NEVER reveal diagnosis or exam findings.\n6. Max 1-2 sentences. {lang_inst}\nHIDDEN CASE: {json.dumps(case, ensure_ascii=False)}\nRECENT CHAT: {json.dumps(history, ensure_ascii=False)}\nDOCTOR ASKS: "{student_message}"\nPatient reply:'
-    try: return f"🧑‍🦱 {'المريض' if lang == 'arabic' else 'Patient'}: {_clean_patient_reply(await call_gemini(prompt, temperature=0.3, max_output_tokens=200))}"
-    except Exception: return "🧑‍🦱 المريض: عذراً، ما سمعتك زين. ممكن تعيد؟"
+    if len(key_norm) == 0:
+        score = 70
+    else:
+        score = min(100, int(len(hit) / len(key_norm) * 100))
 
-def _clean_patient_reply(reply: str) -> str:
-    reply = (reply or "").strip()
-    for p in ["المريض:", "Patient:", "مريض:", "Patient response:", "Reply:"]:
-        if reply.startswith(p): reply = reply[len(p):].strip()
-    if len(reply) > 300:
-        s = re.split(r"[.!?؟]\s", reply)
-        reply = s[0].strip() if s else reply[:250]
-    return reply
+    unnecessary = ordered - key_norm
+    score = max(0, score - len(unnecessary) * 5)
 
-def osce_get_remaining_time(session: dict) -> int: return max(0, int(OSCE_STATION_DURATION_SECONDS - (time.time() - session.get("started_at_ts", time.time()))))
-def osce_format_time(seconds: int) -> str: return f"{seconds // 60:02d}:{seconds % 60:02d}"
-def osce_is_time_up(session: dict) -> bool: return osce_get_remaining_time(session) <= 0
-def osce_should_warn(session: dict) -> bool: return osce_get_remaining_time(session) <= OSCE_WARNING_AT_SECONDS and not session.get("time_warning_sent", False)
+    return {
+        "score":        score,
+        "key_inv":      list(key_inv),
+        "ordered":      list(ordered),
+        "hit":          list(hit),
+        "missed":       list(missed),
+        "unnecessary":  list(unnecessary),
+    }
 
-def osce_keyboard(session: dict) -> InlineKeyboardMarkup:
-    asked = session.get("asked", {}); remaining = osce_get_remaining_time(session); ts = get_tracker_summary(session.get("mark_tracker", {}))
-    def btn(label, cb, done): return InlineKeyboardButton(f"✅ {label}" if done else label, callback_data="osce:already_done" if done else cb)
-    return InlineKeyboardMarkup([
-        [btn("🩺 فحص سريري", "osce:exam", asked.get("exam")), btn("🧪 تحاليل", "osce:labs", asked.get("labs"))],
-        [btn("🩻 تصوير", "osce:imaging", asked.get("imaging")), InlineKeyboardButton("📊 مشاعر (ICE)", callback_data="osce:ice")],
-        [InlineKeyboardButton(f"⏱ {osce_format_time(remaining)} | 📋 {ts.get('done', 0)}/{ts.get('total', '?')}", callback_data="osce:status"), InlineKeyboardButton("🏁 إنهاء", callback_data="osce:end")],
-        [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="back:mode")],
+
+def _osce_v4_vignette_text(session: dict) -> str:
+    case = session["case"]
+    rem = _osce_v4_phase_remaining(session)
+    return (
+        f"🎭 OSCE Station — {case.get('station_title', '')}\n"
+        f"{'━' * 35}\n\n"
+        f"📋 الحالة السريرية:\n{case.get('case_vignette', '')}\n\n"
+        f"{'━' * 35}\n"
+        f"🧠 السؤال 1/3 — التشخيص\n\n"
+        f"بناءً على الحالة أعلاه، اكتب:\n"
+        f"• التشخيص الأرجح\n"
+        f"• واذكر تشخيصين تفريقيين محتملين\n\n"
+        f"⏱ الوقت المتبقي: {_osce_v4_fmt_time(rem)}"
+    )
+
+
+def _osce_v4_management_prompt_text(session: dict, diag_feedback: dict) -> str:
+    case = session["case"]
+    score = diag_feedback.get("score", 0)
+    is_correct = diag_feedback.get("is_correct", False)
+    feedback = diag_feedback.get("feedback_ar", "")
+    correct_dx = diag_feedback.get("correct_diagnosis", "")
+    key_point = diag_feedback.get("key_point", "")
+    rem = _osce_v4_phase_remaining(session)
+
+    emoji = "✅" if is_correct else "⚠️"
+    return (
+        f"{emoji} تقييم التشخيص — {score}/100\n"
+        f"{'━' * 35}\n\n"
+        f"📝 {feedback}\n\n"
+        f"✅ التشخيص الصحيح: {correct_dx}\n"
+        f"💡 نقطة مهمة: {key_point}\n\n"
+        f"{'━' * 35}\n"
+        f"💊 السؤال 2/3 — خطة الإدارة\n\n"
+        f"اكتب خطة الإدارة الكاملة لهذه الحالة:\n"
+        f"• الإجراء الفوري (ABC, stabilization)\n"
+        f"• التحاليل والصور الأساسية\n"
+        f"• العلاج المحدد\n"
+        f"• التوجيه والاستشارة\n\n"
+        f"⏱ الوقت المتبقي: {_osce_v4_fmt_time(rem)}"
+    )
+
+
+def _osce_v4_workup_keyboard(session: dict) -> InlineKeyboardMarkup:
+    ordered_labs    = set(session.get("ordered_labs", []))
+    ordered_imaging = set(session.get("ordered_imaging", []))
+    all_ordered     = ordered_labs | ordered_imaging
+
+    rows = []
+    rows.append([InlineKeyboardButton("🧪 ── التحاليل المخبرية ──", callback_data="osce4:noop")])
+
+    lab_row = []
+    for key, label in OSCE_V4_LAB_OPTIONS:
+        done = key in ordered_labs
+        btn_label = f"✅ {label}" if done else label
+        lab_row.append(InlineKeyboardButton(btn_label, callback_data=f"osce4:lab:{key}"))
+        if len(lab_row) == 2:
+            rows.append(lab_row)
+            lab_row = []
+    if lab_row:
+        rows.append(lab_row)
+
+    rows.append([InlineKeyboardButton("🩻 ── التصوير الشعاعي ──", callback_data="osce4:noop")])
+
+    img_row = []
+    for key, label in OSCE_V4_IMAGING_OPTIONS:
+        done = key in ordered_imaging
+        btn_label = f"✅ {label}" if done else label
+        img_row.append(InlineKeyboardButton(btn_label, callback_data=f"osce4:img:{key}"))
+        if len(img_row) == 2:
+            rows.append(img_row)
+            img_row = []
+    if img_row:
+        rows.append(img_row)
+
+    rows.append([
+        InlineKeyboardButton(
+            f"📊 مراجعة المطلوب ({len(all_ordered)})",
+            callback_data="osce4:review_workup"
+        ),
+        InlineKeyboardButton("🏁 إنهاء وتقرير", callback_data="osce4:finish"),
     ])
+    rows.append([InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="back:mode")])
 
-async def osce_examiner_feedback(session: dict) -> str:
-    case, history, asked, tracker = session.get("case", {}), session.get("history", []), session.get("asked", {}), session.get("mark_tracker", {})
-    ts = get_tracker_summary(tracker); elapsed_str = osce_format_time(OSCE_STATION_DURATION_SECONDS - osce_get_remaining_time(session))
-    obj_score = max(0, ts.get("percentage", 0) - (5 if not asked.get("ice_asked") else 0) - (10 if not asked.get("exam") else 0) - (8 if not asked.get("labs") else 0))
-    missed_str = "\n".join(f"  ❌ {i}" for i in ts.get("missed", [])) or "  ✅ لا يوجد"
-    done_str = "\n".join(f"  ✅ {i}" for i, v in tracker.get("items", {}).items() if v) or "  (لا شيء)"
+    return InlineKeyboardMarkup(rows)
 
-    prompt = f"""You are a Senior Clinical Examiner. Write a strict OSCE Examiner Report in Arabic. FORMAT:
-📋 **تقرير الأوسكي — تقييم المحطة**
-━━━━━━━━━━━━━━━━━━━━
-⏱ الوقت المستغرق: {elapsed_str} / {osce_format_time(OSCE_STATION_DURATION_SECONDS)}
-🎯 الدرجة الموضوعية (Checklist): {obj_score}/100
-📊 تفصيل الأداء:
-✅ ما تم تغطيته:
-{done_str}
-❌ ما تم تفويته:
-{missed_str}
-✅ التشخيص الصحيح: {case.get("hidden_diagnosis", "Unknown")}
-💊 الخطة المثالية: {case.get("management_expected", "Not specified")}
-🏆 نصيحة الاستشاري: [One pearl based on their misses]
-CHAT: {json.dumps(history[-20:], ensure_ascii=False)}
-CASE: {json.dumps(case, ensure_ascii=False)}"""
-    try: return await call_gemini(prompt, temperature=0.1, max_output_tokens=2500)
-    except Exception as e: return f"❌ Error: {str(e)}"
 
-def create_osce_session(case: dict, file_hash: str) -> dict: return {"case": case, "history": [], "file_hash": file_hash, "started_at": datetime.utcnow().isoformat(), "started_at_ts": time.time(), "asked": {"exam": False, "labs": False, "imaging": False, "ice_asked": False}, "mark_tracker": init_mark_tracker(case.get("mark_scheme", [])), "time_warning_sent": False, "turn_count": 0}
+def _osce_v4_workup_prompt_text(session: dict, mgmt_feedback: dict) -> str:
+    score       = mgmt_feedback.get("score", 0)
+    feedback    = mgmt_feedback.get("feedback_ar", "")
+    covered     = mgmt_feedback.get("covered_points", [])
+    missed      = mgmt_feedback.get("missed_points", [])
+    ideal       = mgmt_feedback.get("ideal_summary", "")
+    rem         = _osce_v4_phase_remaining(session)
 
-async def osce_callback_v3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    session = context.user_data.get("osce_session")
-    action = query.data.split(":", 1)[1]
+    covered_str = "\n".join(f"  ✅ {p}" for p in covered) or "  (لا شيء)"
+    missed_str  = "\n".join(f"  ❌ {p}" for p in missed)  or "  ✅ لا يوجد"
 
-    if action in ("already_done", "status"):
-        rem = osce_get_remaining_time(session) if session else 0
-        ts = get_tracker_summary(session.get("mark_tracker", {})) if session else {}
-        await query.answer(f"⏱ {osce_format_time(rem)} متبقي | 📋 {ts.get('done', 0)}/{ts.get('total', '?')} مغطاة", show_alert=True); return
+    return (
+        f"💊 تقييم خطة الإدارة — {score}/100\n"
+        f"{'━' * 35}\n\n"
+        f"📝 {feedback}\n\n"
+        f"✅ ما ذكرته:\n{covered_str}\n\n"
+        f"❌ ما فاتك:\n{missed_str}\n\n"
+        f"💡 الخطة المثالية: {ideal}\n\n"
+        f"{'━' * 35}\n"
+        f"🔬 السؤال 3/3 — التحاليل والتصوير\n\n"
+        f"اختر من الأزرار أدناه التحاليل والصور التي تريد طلبها.\n"
+        f"يمكنك الضغط على أكثر من خيار.\n"
+        f"عند الانتهاء اضغط: 🏁 إنهاء وتقرير\n\n"
+        f"⏱ الوقت المتبقي: {_osce_v4_fmt_time(rem)}"
+    )
 
+
+async def _osce_v4_final_report(session: dict) -> str:
+    case          = session["case"]
+    phase_scores  = session.get("phase_scores", {})
+    answers       = session.get("student_answers", {})
+    workup_eval   = _evaluate_osce_v4_workup(session)
+
+    dx_score   = phase_scores.get("diagnosis",  {}).get("score",  0) if isinstance(phase_scores.get("diagnosis"),  dict) else 0
+    mgmt_score = phase_scores.get("management", {}).get("score",  0) if isinstance(phase_scores.get("management"), dict) else 0
+    inv_score  = workup_eval.get("score", 0)
+
+    total_score = round((dx_score * 0.35) + (mgmt_score * 0.35) + (inv_score * 0.30))
+
+    ordered_labs    = session.get("ordered_labs", [])
+    ordered_imaging = session.get("ordered_imaging", [])
+
+    def lab_name(key):
+        for k, lbl in OSCE_V4_LAB_OPTIONS:
+            if k == key: return lbl
+        return key
+
+    def img_name(key):
+        for k, lbl in OSCE_V4_IMAGING_OPTIONS:
+            if k == key: return lbl
+        return key
+
+    ordered_str = ""
+    if ordered_labs:
+        ordered_str += "  تحاليل: " + ", ".join(lab_name(k) for k in ordered_labs) + "\n"
+    if ordered_imaging:
+        ordered_str += "  صور:     " + ", ".join(img_name(k) for k in ordered_imaging) + "\n"
+    if not ordered_str:
+        ordered_str = "  (لم يطلب شيئاً)\n"
+
+    missed_inv_str = ""
+    if workup_eval.get("missed"):
+        missed_inv_str = "\n  ❌ فاتك: " + ", ".join(workup_eval["missed"])
+
+    grade = (
+        "🏆 ممتاز"      if total_score >= 85 else
+        "✅ جيد جداً"   if total_score >= 70 else
+        "⚠️ مقبول"     if total_score >= 55 else
+        "❌ يحتاج مراجعة"
+    )
+
+    elapsed = int(time.time() - session.get("started_at_ts", time.time()))
+
+    pearl_prompt = (
+        f"Give ONE short Arabic clinical teaching pearl (max 2 sentences) "
+        f"about: {case.get('hidden_diagnosis', '')}. "
+        f"Focus on what a student commonly misses. Reply in Arabic only."
+    )
+    try:
+        pearl = await call_gemini(pearl_prompt, temperature=0.2, max_output_tokens=150)
+    except Exception:
+        pearl = case.get("teaching_pearl", "راجع الحالة مرة أخرى.")
+
+    report = (
+        f"📋 التقرير النهائي — OSCE V4\n"
+        f"{'━' * 38}\n\n"
+        f"🏛 المحطة: {case.get('station_title', '')}\n"
+        f"⏱ الوقت الكلي: {elapsed // 60} دقيقة {elapsed % 60} ثانية\n\n"
+
+        f"{'━' * 38}\n"
+        f"📊 النتيجة الإجمالية: {total_score}/100 — {grade}\n"
+        f"{'━' * 38}\n\n"
+
+        f"🧠 1. التشخيص ({dx_score}/100)\n"
+        f"   إجابتك: {answers.get('diagnosis', '(فارغ)')[:200]}\n"
+        f"   ✅ التشخيص الصحيح: {case.get('hidden_diagnosis', '')}\n\n"
+
+        f"💊 2. الإدارة ({mgmt_score}/100)\n"
+        f"   إجابتك: {answers.get('management', '(فارغ)')[:200]}\n"
+        f"   💡 الخطة المثالية:\n   {case.get('ideal_management', '')[:400]}\n\n"
+
+        f"🔬 3. التحاليل والصور ({inv_score}/100)\n"
+        f"{ordered_str}"
+        f"   ✅ الأهم كان:\n   " + "\n   ".join(f"• {i}" for i in case.get("key_investigations", [])) +
+        missed_inv_str + "\n\n"
+
+        f"{'━' * 38}\n"
+        f"📖 النقطة التعليمية:\n{pearl}\n\n"
+
+        f"{'━' * 38}\n"
+        f"🎓 التشخيصات التفريقية الكاملة:\n" +
+        "\n".join(f"  • {d}" for d in case.get("differential_diagnoses", [])) +
+        f"\n\n🔑 مفتاح التمييز: {case.get('key_discriminating_features', '')}"
+    )
+
+    return report
+
+
+async def handle_osce_v4_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    session = context.user_data.get("osce_v4_session")
     if not session:
-        await query.edit_message_text("⚠️ لا توجد جلسة OSCE نشطة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]])); return
+        return False
 
-    if osce_is_time_up(session) and action != "end":
-        await query.edit_message_text("⏰ انتهى وقت المحطة!\n\nسيتم الآن عرض تقرير الممتحن...", reply_markup=None)
-        await _finish_osce(update, context, session, query=query); return
+    text  = (update.message.text or "").strip()
+    phase = session.get("phase", "diagnosis")
 
-    if action in ("exam", "labs", "imaging"):
-        prep = osce_prepared_response(session, action)
-        if prep:
-            await update_mark_tracker(session["mark_tracker"], f"Student requested {action}", session["case"].get("mark_scheme", []))
-            session["history"].append({"role": "system", "content": prep})
-            chunks = [prep[i:i + 3500] for i in range(0, len(prep), 3500)]
-            try: await query.edit_message_text(chunks[0], reply_markup=osce_keyboard(session))
-            except Exception: await context.bot.send_message(update.effective_chat.id, chunks[0], reply_markup=osce_keyboard(session))
-            for c in chunks[1:]: await context.bot.send_message(update.effective_chat.id, c)
+    if text.lower() in {"انهاء", "إنهاء", "end", "finish", "stop osce", "خلاص"}:
+        await update.message.reply_text("⏳ جاري إصدار التقرير النهائي...")
+        await _osce_v4_send_final_report(update, context, session)
+        return True
 
-    elif action == "ice":
-        session.setdefault("asked", {})["ice_asked"] = True
-        await update_mark_tracker(session["mark_tracker"], "سألت المريض عن مخاوفه وتوقعاته.", session["case"].get("mark_scheme", []))
-        reply = await osce_patient_reply(session, "ما هي مخاوفك وتوقعاتك؟", "ice")
-        session["history"].extend([{"role": "student", "content": "[Asked ICE]"}, {"role": "patient", "content": reply}])
-        try: await query.edit_message_text(reply, reply_markup=osce_keyboard(session))
-        except Exception: await context.bot.send_message(update.effective_chat.id, reply, reply_markup=osce_keyboard(session))
+    if phase == "diagnosis":
+        session["student_answers"]["diagnosis"] = text
+        await update.message.chat.send_action(action="typing")
 
-    elif action == "end":
-        try: await query.edit_message_text("⏳ الممتحن يراجع أداءك...", reply_markup=None)
-        except Exception: pass
-        await _finish_osce(update, context, session, query=query)
+        diag_feedback = await _evaluate_osce_v4_diagnosis(text, session["case"])
+        session["phase_scores"]["diagnosis"] = diag_feedback
 
-async def _finish_osce(update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, query=None):
-    feedback = await osce_examiner_feedback(session); context.user_data.pop("osce_session", None); user = update.effective_user
+        session["phase"]            = "management"
+        session["phase_started_ts"] = time.time()
+
+        prompt_text = _osce_v4_management_prompt_text(session, diag_feedback)
+        await update.message.reply_text(prompt_text)
+        return True
+
+    if phase == "management":
+        session["student_answers"]["management"] = text
+        await update.message.chat.send_action(action="typing")
+
+        mgmt_feedback = await _evaluate_osce_v4_management(text, session["case"])
+        session["phase_scores"]["management"] = mgmt_feedback
+
+        session["phase"]            = "workup"
+        session["phase_started_ts"] = time.time()
+
+        prompt_text = _osce_v4_workup_prompt_text(session, mgmt_feedback)
+        kb = _osce_v4_workup_keyboard(session)
+        await update.message.reply_text(prompt_text, reply_markup=kb)
+        return True
+
+    if phase == "workup":
+        await update.message.reply_text(
+            "💡 استخدم الأزرار أدناه لاختيار التحاليل والصور.\n"
+            "عند الانتهاء اضغط: 🏁 إنهاء وتقرير",
+            reply_markup=_osce_v4_workup_keyboard(session),
+        )
+        return True
+
+    return False
+
+
+async def osce_v4_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    session = context.user_data.get("osce_v4_session")
+    if not session:
+        await query.edit_message_text(
+            "⚠️ انتهت جلسة OSCE أو لا توجد جلسة نشطة.\n"
+            "أرسل /start للبدء من جديد."
+        )
+        return
+
+    data   = query.data
+    parts  = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "noop":
+        return
+
+    if action == "lab" and len(parts) == 3:
+        key = parts[2]
+        labs_ordered = session.setdefault("ordered_labs", [])
+
+        if key in labs_ordered:
+            labs_ordered.remove(key)
+            await query.answer(f"❌ تم إلغاء: {key}", show_alert=False)
+        else:
+            labs_ordered.append(key)
+            result_text = session["case"].get("labs", {}).get(key, "النتيجة غير متوفرة.")
+            await query.answer(f"🧪 {key}: {result_text[:60]}", show_alert=True)
+
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_osce_v4_workup_keyboard(session)
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "img" and len(parts) == 3:
+        key = parts[2]
+        imgs_ordered = session.setdefault("ordered_imaging", [])
+
+        if key in imgs_ordered:
+            imgs_ordered.remove(key)
+            await query.answer(f"❌ تم إلغاء: {key}", show_alert=False)
+        else:
+            imgs_ordered.append(key)
+            result_text = session["case"].get("imaging", {}).get(key, "النتيجة غير متوفرة.")
+            await query.answer(f"🩻 {key}: {result_text[:60]}", show_alert=True)
+
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_osce_v4_workup_keyboard(session)
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "review_workup":
+        ordered_labs    = session.get("ordered_labs", [])
+        ordered_imaging = session.get("ordered_imaging", [])
+        lines = []
+        if ordered_labs:
+            for k in ordered_labs:
+                res = session["case"].get("labs", {}).get(k, "N/A")
+                lines.append(f"🧪 {k}: {res}")
+        if ordered_imaging:
+            for k in ordered_imaging:
+                res = session["case"].get("imaging", {}).get(k, "N/A")
+                lines.append(f"🩻 {k}: {res}")
+        summary = "\n".join(lines) if lines else "لم تطلب أي تحاليل أو صور بعد."
+        await query.answer(summary[:200], show_alert=True)
+        return
+
+    if action == "finish":
+        try:
+            await query.edit_message_text("⏳ الممتحن يراجع أداءك... يرجى الانتظار.")
+        except Exception:
+            pass
+        await _osce_v4_send_final_report(update, context, session, query=query)
+        return
+
+
+async def _osce_v4_send_final_report(update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict, query=None):
+    report = await _osce_v4_final_report(session)
+    context.user_data.pop("osce_v4_session", None)
+
+    user = update.effective_user
     if user:
-        ts = get_tracker_summary(session.get("mark_tracker", {}))
-        xp_points = 40 + int(ts.get("percentage", 0) * 0.4)
-        progress = await db_add_xp(user.id, xp_points, "OSCE completed", osce_done=True)
-        feedback += f"\n\n━━━━━━━━━━━━━━\n⭐ +{xp_points} XP | 🎖 Level {progress.get('level', 1)} | 🔥 Streak {progress.get('streak', 0)} يوم"
-        if progress.get("leveled_up"): feedback += "\n🎉 رفعت مستوى! استمر."
+        phase_scores = session.get("phase_scores", {})
+        dx_score   = phase_scores.get("diagnosis",  {}).get("score",  50) if isinstance(phase_scores.get("diagnosis"),  dict) else 50
+        mgmt_score = phase_scores.get("management", {}).get("score",  50) if isinstance(phase_scores.get("management"), dict) else 50
+        inv_eval   = _evaluate_osce_v4_workup(session)
+        inv_score  = inv_eval.get("score", 50)
+        total      = round((dx_score * 0.35) + (mgmt_score * 0.35) + (inv_score * 0.30))
+        xp_points  = 40 + int(total * 0.5)
+
+        progress = await db_add_xp(user.id, xp_points, "OSCE V4 completed", osce_done=True)
+        report += (
+            f"\n\n{'━' * 38}\n"
+            f"⭐ +{xp_points} XP | 🎖 Level {progress.get('level', 1)} "
+            f"| 🔥 Streak {progress.get('streak', 0)} يوم"
+        )
+        if progress.get("leveled_up"):
+            report += "\n🎉 رفعت مستوى! استمر على هذا المستوى."
+
     chat_id = update.effective_chat.id
-    await context.bot.send_message(chat_id, "✅ انتهت المحطة — هذا تقرير الممتحن:")
-    for chunk in [feedback[i:i + 3800] for i in range(0, len(feedback), 3800)]: await context.bot.send_message(chat_id, chunk)
 
-async def handle_osce_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    session = context.user_data.get("osce_session")
-    if not session: return False
-    text = (update.message.text or "").strip()
-    if text.lower() in {"انهاء", "إنهاء", "end", "finish", "stop osce", "انهي", "خلاص"}:
-        await update.message.reply_text("⏳ الممتحن يراجع أداءك...")
-        await _finish_osce(update, context, session); return True
-    if osce_is_time_up(session):
-        await update.message.reply_text("⏰ انتهى وقت المحطة! جاري إصدار التقرير...")
-        await _finish_osce(update, context, session); return True
-    if osce_should_warn(session):
-        session["time_warning_sent"] = True
-        await update.message.reply_text(f"⚠️ تحذير: تبقى {osce_format_time(osce_get_remaining_time(session))} فقط!")
+    chunks = [report[i:i + 3800] for i in range(0, len(report), 3800)]
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="back:mode")]])
 
-    session["turn_count"] = session.get("turn_count", 0) + 1; ctx = " | ".join([h.get("content", "")[:50] for h in session.get("history", [])[-3:]])
-    await update.message.chat.send_action(action="typing")
-    intent = await detect_osce_intent_ai(text, ctx)
-    session["history"].append({"role": "student", "content": text})
+    for i, chunk in enumerate(chunks):
+        if i == len(chunks) - 1:
+            await context.bot.send_message(chat_id, chunk, reply_markup=back_kb)
+        else:
+            await context.bot.send_message(chat_id, chunk)
 
-    newly_checked = await update_mark_tracker(session["mark_tracker"], text, session["case"].get("mark_scheme", []))
-    prep = osce_prepared_response(session, intent)
-    if prep: session["history"].append({"role": "system", "content": prep}); reply_text = prep
-    else: reply_text = await osce_patient_reply(session, text, intent); session["history"].append({"role": "patient", "content": reply_text})
+# =============================================================================
+# ADMIN STAGING COMMANDS (THE PIPELINE)
+# =============================================================================
 
-    if newly_checked: ts = get_tracker_summary(session["mark_tracker"]); reply_text += f"\n\n💡 [{ts['done']}/{ts['total']} عناصر مغطاة]"
-    rem = osce_get_remaining_time(session); ftr = f"\n⏱ {osce_format_time(rem)} متبقي" if rem < 180 else ""
-    try: await update.message.reply_text(reply_text + ftr, reply_markup=osce_keyboard(session))
-    except Exception: await update.message.reply_text(reply_text.replace("*", "") + ftr, reply_markup=osce_keyboard(session))
-    return True
+async def stage_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        return await update.message.reply_text(f"⛔ عذراً، هذا الأمر للإدارة فقط!\n\nرقم הـ ID الخاص بك هو:\n{update.effective_user.id}", parse_mode="Markdown")
+    if len(context.args) < 2: return await update.message.reply_text("استخدم: /stage_start [uni] [subject]")
+    context.user_data["active_staging"] = {"uni": context.args[0].lower(), "subject": context.args[1].lower()}
+    await update.message.reply_text("📥 بدأ التجميع! أي نص/صورة/ملف ترسله سيُخزن للمراجعة.\nللتصدير: /stage_dump", parse_mode="Markdown")
+
+async def stage_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS or not context.user_data.get("active_staging"): return
+    st = context.user_data["active_staging"]
+    uni, subject = st["uni"], st["subject"]
+
+    def get_dump():
+        conn = _db_connect()
+        rows = conn.execute("SELECT raw_content FROM admin_staging WHERE user_id=? AND uni=? AND subject=? ORDER BY created_at ASC", (user_id, uni, subject)).fetchall()
+        content = [r["raw_content"] for r in rows]
+        conn.execute("DELETE FROM admin_staging WHERE user_id=? AND uni=? AND subject=?", (user_id, uni, subject))
+        conn.commit()
+        conn.close()
+        return content
+
+    async with _db_lock:
+        content_list = await asyncio.to_thread(get_dump)
+
+    if not content_list: return await update.message.reply_text("المستودع فارغ.")
+
+    txt = "\n\n========================================\n".join(content_list)
+    f = io.BytesIO(txt.encode('utf-8')); f.name = f"dump_{uni}_{subject}.txt"
+    context.user_data.pop("active_staging", None)
+    await context.bot.send_document(update.effective_chat.id, f, caption="📦 المستودع تم تصديره وتفريغه. قم بتنظيفه بـ ChatGPT ثم استخدم /upload_final")
+
+async def upload_final_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS: return
+    if len(context.args) < 2: return await update.message.reply_text("استخدم: /upload_final [uni] [subject] وارفق الـ JSON")
+    context.user_data["pending_final"] = {"uni": context.args[0].lower(), "subject": context.args[1].lower()}
+    await update.message.reply_text("🔄 مستعد. أرسل الآن ملف الـ JSON النهائي لرفعه للطلبة.")
+
+async def handle_admin_acc(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    st = context.user_data.get("active_staging")
+    if not st: return
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            conn.execute("INSERT INTO admin_staging (user_id, uni, subject, raw_content, created_at) VALUES (?, ?, ?, ?, ?)",
+                         (update.effective_user.id, st["uni"], st["subject"], text, datetime.utcnow().isoformat()))
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(work)
+    await update.message.reply_text("✅ [المستودع المؤقت]: تم التقاط وحفظ المحتوى بنجاح.")
 
 # =============================================================================
 # KEYBOARDS & GENERAL UI
 # =============================================================================
+
 def lang_keyboard() -> InlineKeyboardMarkup: return InlineKeyboardMarkup([[InlineKeyboardButton("🇸🇦 العربية", callback_data="lang:ar"), InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")]])
 def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -992,6 +1372,7 @@ def format_review(entry: dict, idx: int, total: int, user_data: dict) -> str:
 # =============================================================================
 # SENDERS & COMMANDS
 # =============================================================================
+
 async def safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
     for _ in range(2):
         try: await bot.send_message(chat_id=chat_id, text=text, **kwargs); return True
@@ -1026,8 +1407,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE): awai
 async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text(t(context.user_data, "choose_lang"), reply_markup=lang_keyboard())
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    had = any(k in context.user_data for k in ("session", "pending_file", "review", "osce_session"))
-    for k in ("session", "pending_file", "pending_mode", "pending_summary_style", "review", "review_pool", "busy", "osce_session"): context.user_data.pop(k, None)
+    had = any(k in context.user_data for k in ("session", "pending_file", "review", "osce_session", "osce_v4_session"))
+    for k in ("session", "pending_file", "pending_mode", "pending_summary_style", "review", "review_pool", "busy", "osce_session", "osce_v4_session"): context.user_data.pop(k, None)
     await update.message.reply_text(t(context.user_data, "stopped" if had else "no_active"))
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1055,6 +1436,7 @@ async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 # CALLBACKS
 # =============================================================================
+
 async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); lang = query.data.split(":", 1)[1]
     if lang in SUPPORTED_LANGS: context.user_data["lang"] = lang; await query.edit_message_text(main_menu_text(context.user_data), reply_markup=mode_keyboard(context.user_data))
@@ -1081,8 +1463,7 @@ async def pp_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = query.data.split(":")
     if len(parts) < 3: return
     uni, subject = parts[1], parts[2]
-    
-    # دمج التحديث الجديد: سحب البيانات وتشغيل الاختبار فوراً من Past Papers
+
     async with _db_lock:
         def work():
             conn = _db_connect()
@@ -1098,7 +1479,7 @@ async def pp_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         questions = json.loads(row["questions_json"])
         pool = [shuffle_options(q) for q in questions]
         random.shuffle(pool)
-        selected = pool[:min(50, len(pool))] 
+        selected = pool[:min(50, len(pool))]
         context.user_data["session"] = {"quiz_id": str(uuid.uuid4())[:8], "questions": selected, "current": 0, "score": 0, "wrong": [], "level": f"past_{uni}_{subject}"}
         await query.edit_message_text(f"✅ **تم العثور على امتحانات السنوات السابقة بنجاح!**\n\n📚 المادة: {subject}\n📝 إجمالي الأسئلة: {len(selected)} سؤالاً تفاعلياً.\n\nجاري تشغيل محرك الاختبار الآن...", parse_mode="Markdown")
         await asyncio.sleep(1.2)
@@ -1158,8 +1539,8 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     feedback = f"{format_question(q, idx + 1, len(questions), context.user_data)}\n\n{escape_md(res)}\n{t(context.user_data, 'answer')} {q['correct']}. {escape_md(q['options'].get(q['correct'], ''))}\n\n{t(context.user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
     chunks = [feedback[i:i + 4000] for i in range(0, len(feedback), 4000)]
     try: await query.edit_message_text(chunks[0], parse_mode="Markdown")
-    except Exception: await query.edit_message_reply_markup(reply_markup=None); await context.bot.send_message(update.effective_chat.id, chunks[0].replace("*", ""))
-    for c in chunks[1:]: await context.bot.send_message(update.effective_chat.id, c.replace("*", ""))
+    except Exception: await query.edit_message_reply_markup(reply_markup=None); await context.bot.send_message(update.effective_chat.id, chunks[0].replace("", ""))
+    for c in chunks[1:]: await context.bot.send_message(update.effective_chat.id, c.replace("", ""))
     session["current"] += 1; await asyncio.sleep(0.4)
     if session["current"] >= len(questions): await send_final_score(update.effective_chat.id, context)
     else: await send_current_question(update.effective_chat.id, context)
@@ -1193,8 +1574,8 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             if i == len(chunks) - 1: await context.bot.send_message(chat_id, c, parse_mode="Markdown", reply_markup=review_keyboard(current, len(pool)))
             else: await context.bot.send_message(chat_id, c, parse_mode="Markdown")
         except Exception:
-            if i == len(chunks) - 1: await context.bot.send_message(chat_id, c.replace("*", ""), reply_markup=review_keyboard(current, len(pool)))
-            else: await context.bot.send_message(chat_id, c.replace("*", ""))
+            if i == len(chunks) - 1: await context.bot.send_message(chat_id, c.replace("", ""), reply_markup=review_keyboard(current, len(pool)))
+            else: await context.bot.send_message(chat_id, c.replace("", ""))
 
 async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); await db_register_user(update.effective_user); action = query.data.split(":", 1)[1]
@@ -1215,7 +1596,7 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db_register_user(update.effective_user)
         await db_create_payment_request(update.effective_user.id, "User opened payment request")
         await send_admin_log(context, f"💎 طلب اشتراك\nUser ID: {update.effective_user.id}\nName: {update.effective_user.full_name}")
-    await query.edit_message_text("🧾 تم فتح طلب اشتراك مبدئي.\nللتفعيل اليدوي: اضغط الدعم وأرسل إثبات الدفع.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📞 الدعم", callback_data="back:support")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
+        await query.edit_message_text("🧾 تم فتح طلب اشتراك مبدئي.\nللتفعيل اليدوي: اضغط الدعم وأرسل إثبات الدفع.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📞 الدعم", callback_data="back:support")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
 
 async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); parts = query.data.split(":"); target = parts[1] if len(parts) > 1 else "mode"
@@ -1237,63 +1618,14 @@ async def send_admin_log(context: ContextTypes.DEFAULT_TYPE, text: str):
     except Exception: pass
 
 # =============================================================================
-# ADMIN STAGING PIPELINE COMMANDS & HANDLERS
-# =============================================================================
-async def stage_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
-        return await update.message.reply_text(f"⛔ عذراً، هذا الأمر للإدارة فقط!\n\nرقم الـ ID الخاص بك هو:\n`{update.effective_user.id}`", parse_mode="Markdown")
-    if len(context.args) < 2: return await update.message.reply_text("استخدم: /stage_start [uni] [subject]")
-    context.user_data["active_staging"] = {"uni": context.args[0].lower(), "subject": context.args[1].lower()}
-    await update.message.reply_text("📥 **بدأ التجميع!** أي نص/صورة/ملف ترسله سيُخزن للمراجعة.\nللتصدير: /stage_dump", parse_mode="Markdown")
-
-async def stage_dump_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_USER_IDS or not context.user_data.get("active_staging"): return
-    st = context.user_data["active_staging"]; uni, subject = st["uni"], st["subject"]
-    
-    def get_dump():
-        conn = _db_connect()
-        rows = conn.execute("SELECT raw_content FROM admin_staging WHERE user_id=? AND uni=? AND subject=? ORDER BY created_at ASC", (user_id, uni, subject)).fetchall()
-        content = [r["raw_content"] for r in rows]
-        conn.execute("DELETE FROM admin_staging WHERE user_id=? AND uni=? AND subject=?", (user_id, uni, subject))
-        conn.commit(); conn.close()
-        return content
-
-    async with _db_lock: content_list = await asyncio.to_thread(get_dump)
-    if not content_list: return await update.message.reply_text("المستودع فارغ.")
-    
-    txt = "\n\n========================================\n".join(content_list)
-    f = io.BytesIO(txt.encode('utf-8')); f.name = f"dump_{uni}_{subject}.txt"
-    context.user_data.pop("active_staging", None)
-    await context.bot.send_document(update.effective_chat.id, f, caption="📦 المستودع تم تصديره وتفريغه. قم بتنظيفه بـ ChatGPT ثم استخدم /upload_final")
-
-async def upload_final_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS: return
-    if len(context.args) < 2: return await update.message.reply_text("استخدم: /upload_final [uni] [subject] وارفق الـ JSON")
-    context.user_data["pending_final"] = {"uni": context.args[0].lower(), "subject": context.args[1].lower()}
-    await update.message.reply_text("🔄 مستعد. أرسل الآن ملف الـ JSON النهائي لرفعه للطلبة.")
-
-async def handle_admin_acc(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    st = context.user_data.get("active_staging")
-    if not st: return
-    async with _db_lock:
-        def work():
-            conn = _db_connect()
-            conn.execute("INSERT INTO admin_staging (user_id, uni, subject, raw_content, created_at) VALUES (?, ?, ?, ?, ?)", (update.effective_user.id, st["uni"], st["subject"], text, datetime.utcnow().isoformat()))
-            conn.commit(); conn.close()
-        await asyncio.to_thread(work)
-    await update.message.reply_text("✅ [المستودع المؤقت]: تم التقاط وحفظ المحتوى بنجاح.")
-
-# =============================================================================
 # FILE & PHOTO HANDLING
 # =============================================================================
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # جدار الحماية (Vision متاح للأدمن فقط)
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("⚠️ عذراً، ميزة قراءة الصور وتحليلها مخصصة للإدارة فقط لتوفير استهلاك الـ API.\nيرجى إرسال ملفات نصية (PDF, Word).")
         return
-    # للأدمن في حالة التجميع
     if context.user_data.get("active_staging"):
         status = await update.message.reply_text("🩻 [الأدمن]: صورة ورقة امتحان مكتشفة! جاري تشغيل الـ Vision مجاناً...")
         photo_file = await update.message.photo[-1].get_file()
@@ -1344,7 +1676,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3. مسار الطلبة العادي
     if user and await cooldown_guard(update, context.user_data, user.id): return
     if context.user_data.get("busy"): return await update.message.reply_text(t(context.user_data, "busy"))
-    
+
     context.user_data["busy"] = True
     try:
         file_type = classify_document(doc.mime_type or "", doc.file_name or "")
@@ -1367,15 +1699,20 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         mode = context.user_data.get("pending_mode", "quiz")
 
+        # --- OSCE V4 integration ---
         if mode == "osce":
-            if not await check_daily_limit(update, context, "osce"): return
+            if not await check_daily_limit(update, context, "osce"):
+                return
             await status.edit_text(t(context.user_data, "osce_generating"))
-            case = await generate_osce_case(text)
-            context.user_data["osce_session"] = create_osce_session(case, file_hash)
-            context.user_data.pop("pending_mode", None); increment_daily_usage(context.user_data, "osce")
-            if user: await db_add_xp(user.id, 10, "OSCE case started")
-            opening = str(case.get("opening_statement", "Doctor, I am worried about my symptoms."))
-            await status.edit_text(f"{t(context.user_data, 'osce_ready')}\n\n🧑‍🦱 المريض/Patient: {opening}\n\nابدأ بسؤال المريض.", reply_markup=osce_keyboard(context.user_data["osce_session"]))
+            case = await generate_osce_v4_case(text)
+            session = create_osce_v4_session(case, file_hash)
+            context.user_data["osce_v4_session"] = session
+            context.user_data.pop("pending_mode", None)
+            increment_daily_usage(context.user_data, "osce")
+            if user:
+                await db_add_xp(user.id, 10, "OSCE V4 case started")
+            vignette_text = _osce_v4_vignette_text(session)
+            await status.edit_text(vignette_text)
             return
 
         if mode == "summary":
@@ -1408,8 +1745,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
 
-    if await handle_osce_text(update, context): return
-    
+    # OSCE V4 text handler replaces old handler
+    if await handle_osce_v4_text(update, context): return
+
     if user.id in ADMIN_USER_IDS and context.user_data.get("active_staging") and not text.startswith('/'):
         return await handle_admin_acc(update, context, text)
 
@@ -1432,6 +1770,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 # MAIN
 # =============================================================================
+
 BOT_COMMANDS = [
     BotCommand("start", "الرئيسية"),
     BotCommand("help", "مساعدة"),
@@ -1456,7 +1795,7 @@ def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
     application = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(post_init).build()
     application.add_error_handler(error_handler)
-    
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stop", stop_command))
@@ -1480,7 +1819,8 @@ def main():
     application.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^ans:"))
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
     application.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^panel:"))
-    application.add_handler(CallbackQueryHandler(osce_callback_v3, pattern=r"^osce:"))
+    # استبدال معالج OSCE القديم بمعالج OSCE V4
+    application.add_handler(CallbackQueryHandler(osce_v4_callback, pattern=r"^osce4:"))
     application.add_handler(CallbackQueryHandler(payment_callback, pattern=r"^payment:"))
     application.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
     application.add_handler(CallbackQueryHandler(back_callback, pattern=r"^back:"))
