@@ -19,6 +19,7 @@ import sqlite3
 import time
 import uuid
 import base64
+import zipfile
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +35,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    ApplicationHandlerStop,
     filters,
 )
 
@@ -226,6 +228,9 @@ def t(user_data: dict, key: str, **kwargs) -> str:
 _db_lock = asyncio.Lock()
 
 def _db_connect() -> sqlite3.Connection:
+    db_dir = os.path.dirname(DATABASE_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -246,6 +251,7 @@ def init_db() -> None:
     # الجداول الإضافية لميزة الـ Past Papers والتجميع العشوائي  
     cur.execute("CREATE TABLE IF NOT EXISTS past_papers (id INTEGER PRIMARY KEY AUTOINCREMENT, uni TEXT NOT NULL, subject TEXT NOT NULL, questions_json TEXT NOT NULL, created_at TEXT)")  
     cur.execute("CREATE TABLE IF NOT EXISTS admin_staging (user_id INTEGER NOT NULL, uni TEXT NOT NULL, subject TEXT NOT NULL, raw_content TEXT NOT NULL, created_at TEXT)")  
+    cur.execute("CREATE TABLE IF NOT EXISTS past_progress (user_id INTEGER NOT NULL, uni TEXT NOT NULL, subject TEXT NOT NULL, attempts INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, wrong INTEGER DEFAULT 0, wrong_json TEXT DEFAULT '[]', updated_at TEXT, PRIMARY KEY (user_id, uni, subject))")  
       
     conn.commit()  
     conn.close()
@@ -1335,12 +1341,15 @@ async def handle_admin_acc(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
 def lang_keyboard() -> InlineKeyboardMarkup: return InlineKeyboardMarkup([[InlineKeyboardButton("🇸🇦 العربية", callback_data="lang:ar"), InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")]])
 def mode_keyboard(user_data: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(t(user_data, "mode_quiz"), callback_data="mode:quiz"), InlineKeyboardButton(t(user_data, "mode_summary"), callback_data="mode:summary")],
         [InlineKeyboardButton(t(user_data, "mode_osce"), callback_data="mode:osce"), InlineKeyboardButton(t(user_data, "mode_past_papers"), callback_data="mode:past_papers")],
         [InlineKeyboardButton(t(user_data, "mode_progress"), callback_data="panel:progress"), InlineKeyboardButton(t(user_data, "mode_leaderboard"), callback_data="panel:leaderboard")],
-        [InlineKeyboardButton(t(user_data, "mode_subscription"), callback_data="panel:subscription"), InlineKeyboardButton("📞 الدعم", callback_data="back:support")],
-    ])
+        [InlineKeyboardButton(t(user_data, "mode_subscription"), callback_data="panel:subscription"), InlineKeyboardButton("📞 الدعم", callback_data="panel:support")],
+    ]
+    if user_data.get("is_admin"):
+        rows.append([InlineKeyboardButton("🛠️ لوحة الأدمن", callback_data="admin:home")])
+    return InlineKeyboardMarkup(rows)
 def summary_style_keyboard(user_data: dict) -> InlineKeyboardMarkup: return InlineKeyboardMarkup([[InlineKeyboardButton(t(user_data, "style_disease"), callback_data="style:disease_v2")], [InlineKeyboardButton(t(user_data, "style_highyield"), callback_data="style:highyield")], [InlineKeyboardButton(t(user_data, "style_osce"), callback_data="style:osce")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]])
 def level_keyboard(setup_id: str, user_data: dict) -> InlineKeyboardMarkup: return InlineKeyboardMarkup([[InlineKeyboardButton(t(user_data, "level_basic"), callback_data=f"level:{setup_id}:basic")], [InlineKeyboardButton(t(user_data, "level_cases"), callback_data=f"level:{setup_id}:cases")], [InlineKeyboardButton(t(user_data, "level_challenge"), callback_data=f"level:{setup_id}:challenge")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]])
 def basic_count_keyboard(setup_id: str) -> InlineKeyboardMarkup: return InlineKeyboardMarkup([[InlineKeyboardButton("5", callback_data=f"count:{setup_id}:5"), InlineKeyboardButton("10", callback_data=f"count:{setup_id}:10"), InlineKeyboardButton("20", callback_data=f"count:{setup_id}:20")], [InlineKeyboardButton("30", callback_data=f"count:{setup_id}:30"), InlineKeyboardButton("40", callback_data=f"count:{setup_id}:40")], [InlineKeyboardButton("⬅️ رجوع", callback_data=f"back:levels:{setup_id}")]])
@@ -1434,132 +1443,481 @@ async def testbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e: await update.message.reply_text(f"❌ Failed: {e}")
 
 # =============================================================================
-# CALLBACKS
+# CALLBACKS — STABLE ROUTER + PAST PAPERS + ADMIN PANEL
 # =============================================================================
 
-async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); lang = query.data.split(":", 1)[1]
-    if lang in SUPPORTED_LANGS: context.user_data["lang"] = lang; await query.edit_message_text(main_menu_text(context.user_data), reply_markup=mode_keyboard(context.user_data))
+PAST_SUBJECTS = [
+    ("forensic", "⚖️ طب شرعي (Forensic)"),
+    ("obgyn", "🤰 نساء وولادة (Ob/Gyn)"),
+    ("ophthalmology", "👁️ عيون (Ophthalmology)"),
+    ("radiology", "🩻 أشعة (Radiology)"),
+    ("community", "👥 مجتمع وأسرة (Community)"),
+]
+SUBJECT_LABELS = dict(PAST_SUBJECTS)
+UNI_LABELS = {"ajdabiya": "جامعة أجدابيا", "benghazi": "جامعة بنغازي"}
 
-async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); mode = query.data.split(":", 1)[1]
-    if mode == "past_papers": return await query.edit_message_text("📂 بنك الامتحانات (السنوات السابقة)\n\nاختر الجامعة التي تبحث عن أسئلتها:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏛️ جامعة أجدابيا", callback_data="pp_uni:ajdabiya")], [InlineKeyboardButton("🏛️ جامعة بنغازي", callback_data="pp_uni:benghazi")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
-    if mode not in ("quiz", "summary", "osce"): return
-    context.user_data["pending_mode"] = mode; await query.edit_message_reply_markup(reply_markup=None)
-    if mode == "summary": await context.bot.send_message(update.effective_chat.id, t(context.user_data, "summary_style_prompt") + "\n\n" + ai_queue_status_text(), reply_markup=summary_style_keyboard(context.user_data))
-    elif mode == "osce": await context.bot.send_message(update.effective_chat.id, t(context.user_data, "mode_osce_prompt") + "\n\n" + ai_queue_status_text())
-    else: await context.bot.send_message(update.effective_chat.id, t(context.user_data, "mode_quiz_prompt") + "\n\n" + ai_queue_status_text())
 
-async def pp_uni_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); uni = query.data.split(":", 1)[1]
-    if uni == "ajdabiya":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚖️ طب شرعي", callback_data=f"pp_sub:{uni}:forensic"), InlineKeyboardButton("🤰 نساء وتوليد", callback_data=f"pp_sub:{uni}:obgyn")], [InlineKeyboardButton("👁️ عيون", callback_data=f"pp_sub:{uni}:ophthalmology"), InlineKeyboardButton("🩻 أشعة", callback_data=f"pp_sub:{uni}:radiology")], [InlineKeyboardButton("👨‍👩‍👧 طب أسرة ومجتمع", callback_data=f"pp_sub:{uni}:community")], [InlineKeyboardButton("⬅️ رجوع للجامعات", callback_data="mode:past_papers")]])
-    else:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤰 نساء وتوليد", callback_data=f"pp_sub:{uni}:obgyn"), InlineKeyboardButton("👶 أطفال", callback_data=f"pp_sub:{uni}:peds")], [InlineKeyboardButton("💊 أدوية (فارما)", callback_data=f"pp_sub:{uni}:pharma"), InlineKeyboardButton("🔬 باثولوجي", callback_data=f"pp_sub:{uni}:patho")], [InlineKeyboardButton("⬅️ رجوع للجامعات", callback_data="mode:past_papers")]])
-    await query.edit_message_text(f"🏛️ {'جامعة أجدابيا' if uni == 'ajdabiya' else 'جامعة بنغازي'}\n\nاختر المادة لتصفح امتحانات السنوات السابقة:", reply_markup=kb)
+def _safe_callback_data(data: str) -> str:
+    """Normalize old and new callback codes so old Telegram messages keep working."""
+    if not data:
+        return ""
+    replacements = {
+        "pp_uni:": "pp:uni:",
+        "pp-uni:": "pp:uni:",
+        "pp-uni2:": "pp:uni:",
+        "pp_uni2:": "pp:uni:",
+        "pp_sub:": "pp:subject:",
+        "pp-sub:": "pp:subject:",
+        "pp_menu:": "pp:subject:",
+        "pp-menu:": "pp:subject:",
+        "pp_mode:": "pp:mode:",
+        "pp-mode:": "pp:mode:",
+        "pp_quiz_start:": "pp:quiz:",
+        "pp-quiz-start:": "pp:quiz:",
+        "pp_quiz_next:": "pp:quiznext:",
+        "pp-quiz-next:": "pp:quiznext:",
+        "pp_wrong:": "pp:wrong:",
+        "pp-wrong:": "pp:wrong:",
+        "pp_progress:": "pp:progress:",
+        "pp-progress:": "pp:progress:",
+        "pp_ans:": "pp:ans:",
+        "pp-ans:": "pp:ans:",
+        "pp-past:home": "pp:home",
+    }
+    for old, new in replacements.items():
+        if data.startswith(old):
+            return data.replace(old, new, 1)
+    if data == "mode:past_papers" or data == "mode:past-papers":
+        return "pp:home"
+    if data == "back:mode" or data == "back:main":
+        return "main:home"
+    if data == "back:support":
+        return "panel:support"
+    return data
 
-async def pp_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    parts = query.data.split(":")
-    if len(parts) < 3: return
-    uni, subject = parts[1], parts[2]
+async def safe_edit(query, text: str, reply_markup=None, **kwargs):
+    try:
+        return await query.edit_message_text(text, reply_markup=reply_markup, **kwargs)
+    except Exception as e:
+        logger.warning("edit_message_text failed; sending new message: %s", e)
+        try:
+            return await query.message.reply_text(text, reply_markup=reply_markup, **kwargs)
+        except Exception:
+            logger.exception("safe_edit failed completely")
+            return None
 
+async def safe_answer_query(query, text: str = None, show_alert: bool = False):
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+    except Exception:
+        pass
+
+def past_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏛️ جامعة أجدابيا", callback_data="pp:uni:ajdabiya")],
+        [InlineKeyboardButton("🏛️ جامعة بنغازي", callback_data="pp:uni:benghazi")],
+        [InlineKeyboardButton("⬅️ رجوع للرئيسية", callback_data="main:home")],
+    ])
+
+def past_subjects_keyboard(uni: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label, callback_data=f"pp:subject:{uni}:{sub}")] for sub, label in PAST_SUBJECTS]
+    rows.append([InlineKeyboardButton("⬅️ رجوع للجامعات", callback_data="pp:home")])
+    return InlineKeyboardMarkup(rows)
+
+def pp_subject_menu_keyboard(uni: str, subject: str, has_wrong: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎯 تدريب عشوائي", callback_data=f"pp:mode:random:{uni}:{subject}")],
+        [InlineKeyboardButton("📚 حل بالترتيب", callback_data=f"pp:mode:seq:{uni}:{subject}")],
+        [InlineKeyboardButton("📝 اختبار 20 سؤال", callback_data=f"pp:quiz:{uni}:{subject}")],
+        [InlineKeyboardButton("❌ راجع أخطائي", callback_data=f"pp:wrong:{uni}:{subject}")],
+        [InlineKeyboardButton("📊 تقدمي", callback_data=f"pp:progress:{uni}:{subject}")],
+        [InlineKeyboardButton("⬅️ رجوع للمواد", callback_data=f"pp:uni:{uni}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _pp_question_fingerprint(q: dict) -> str:
+    base = json.dumps({"q": q.get("question", ""), "o": q.get("options", {})}, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+def _pp_normalize_question(q: dict) -> Optional[dict]:
+    if not isinstance(q, dict):
+        return None
+    question = str(q.get("question") or q.get("q") or q.get("stem") or "").strip()
+    options = q.get("options") or q.get("choices") or {}
+    answer = str(q.get("correct") or q.get("correct_answer") or q.get("answer") or q.get("correctAnswer") or "").strip()
+    explanation = str(q.get("explanation") or q.get("explain") or "").strip()
+    if isinstance(options, list):
+        letters = list("ABCDE")
+        options = {letters[i]: str(v) for i, v in enumerate(options[:5])}
+    if not isinstance(options, dict):
+        return None
+    norm_opts = {}
+    for l in "ABCDE":
+        val = options.get(l) or options.get(l.lower())
+        norm_opts[l] = str(val or "").strip()
+    if not question or not any(norm_opts.values()):
+        return None
+    if not norm_opts["E"]:
+        norm_opts["E"] = "None of the above"
+    answer = answer.upper().strip()
+    if answer not in list("ABCDE"):
+        for l, val in norm_opts.items():
+            if answer and answer.lower() == val.lower():
+                answer = l
+                break
+    if answer not in list("ABCDE"):
+        answer = "A"
+    return {"question": question, "options": norm_opts, "correct": answer, "explanation": explanation or "من أسئلة السنوات السابقة."}
+
+async def pp_load_questions(uni: str, subject: str) -> List[dict]:
+    def work():
+        conn = _db_connect()
+        rows = conn.execute("SELECT questions_json FROM past_papers WHERE lower(uni)=lower(?) AND lower(subject)=lower(?) ORDER BY id ASC", (uni, subject)).fetchall()
+        conn.close()
+        out = []
+        seen = set()
+        for row in rows:
+            try:
+                arr = json.loads(row["questions_json"])
+                if not isinstance(arr, list):
+                    continue
+                for item in arr:
+                    nq = _pp_normalize_question(item)
+                    if not nq:
+                        continue
+                    fp = _pp_question_fingerprint(nq)
+                    if fp in seen:
+                        continue
+                    seen.add(fp)
+                    out.append(nq)
+            except Exception:
+                continue
+        return out
+    return await asyncio.to_thread(work)
+
+async def pp_get_progress(user_id: int, uni: str, subject: str) -> dict:
+    def work():
+        conn = _db_connect()
+        row = conn.execute("SELECT * FROM past_progress WHERE user_id=? AND uni=? AND subject=?", (user_id, uni, subject)).fetchone()
+        conn.close()
+        if not row:
+            return {"attempts": 0, "correct": 0, "wrong": 0, "wrong_json": "[]"}
+        return dict(row)
+    return await asyncio.to_thread(work)
+
+async def pp_record_answer(user_id: int, uni: str, subject: str, question: dict, is_correct: bool):
+    fp = _pp_question_fingerprint(question)
     async with _db_lock:
         def work():
             conn = _db_connect()
-            row = conn.execute("SELECT questions_json FROM past_papers WHERE uni=? AND subject=? ORDER BY id DESC LIMIT 1", (uni, subject)).fetchone()
+            row = conn.execute("SELECT * FROM past_progress WHERE user_id=? AND uni=? AND subject=?", (user_id, uni, subject)).fetchone()
+            if row:
+                attempts = int(row["attempts"] or 0)
+                correct = int(row["correct"] or 0)
+                wrong = int(row["wrong"] or 0)
+                try:
+                    wrong_list = json.loads(row["wrong_json"] or "[]")
+                except Exception:
+                    wrong_list = []
+            else:
+                attempts = correct = wrong = 0
+                wrong_list = []
+            attempts += 1
+            if is_correct:
+                correct += 1
+                wrong_list = [x for x in wrong_list if x.get("fp") != fp]
+            else:
+                wrong += 1
+                item = dict(question)
+                item["fp"] = fp
+                wrong_list = [x for x in wrong_list if x.get("fp") != fp]
+                wrong_list.append(item)
+                wrong_list = wrong_list[-200:]
+            conn.execute(
+                "INSERT OR REPLACE INTO past_progress(user_id, uni, subject, attempts, correct, wrong, wrong_json, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (user_id, uni, subject, attempts, correct, wrong, json.dumps(wrong_list, ensure_ascii=False), datetime.utcnow().isoformat()),
+            )
+            conn.commit()
             conn.close()
-            return dict(row) if row else None
-        row = await asyncio.to_thread(work)
+        await asyncio.to_thread(work)
 
-    if not row:
-        subject_names = {"forensic": "طب شرعي", "obgyn": "نساء وتوليد", "ophthalmology": "عيون", "radiology": "أشعة", "community": "طب أسرة ومجتمع", "peds": "أطفال", "pharma": "أدوية", "patho": "باثولوجي"}
-        await query.edit_message_text(f"🚧 قسم {subject_names.get(subject, subject)} متاح للطلبة ولكن لم يتم حقن أي امتحانات رسمية فيه بعد. سيقوم الإدمن بملء الأسئلة قريباً.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع للمواد", callback_data=f"pp_uni:{uni}")]]))
+async def show_main_menu(query, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["is_admin"] = is_admin_user(query.from_user.id if query.from_user else None)
+    await safe_edit(query, main_menu_text(context.user_data), reply_markup=mode_keyboard(context.user_data))
+
+async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    lang = query.data.split(":", 1)[1]
+    if lang in SUPPORTED_LANGS:
+        context.user_data["lang"] = lang
+    context.user_data["is_admin"] = is_admin_user(query.from_user.id if query.from_user else None)
+    await show_main_menu(query, context)
+
+async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    if data == "pp:home":
+        return await pp_home_callback(update, context)
+    mode = data.split(":", 1)[1] if ":" in data else ""
+    if mode not in ("quiz", "summary", "osce"):
+        return await show_main_menu(query, context)
+    context.user_data["pending_mode"] = mode
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if mode == "summary":
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "summary_style_prompt") + "\n\n" + ai_queue_status_text(), reply_markup=summary_style_keyboard(context.user_data))
+    elif mode == "osce":
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "mode_osce_prompt") + "\n\n" + ai_queue_status_text())
     else:
-        questions = json.loads(row["questions_json"])
-        pool = [shuffle_options(q) for q in questions]
-        random.shuffle(pool)
-        selected = pool[:min(50, len(pool))]
-        context.user_data["session"] = {"quiz_id": str(uuid.uuid4())[:8], "questions": selected, "current": 0, "score": 0, "wrong": [], "level": f"past_{uni}_{subject}"}
-        await query.edit_message_text(f"✅ **تم العثور على امتحانات السنوات السابقة بنجاح!**\n\n📚 المادة: {subject}\n📝 إجمالي الأسئلة: {len(selected)} سؤالاً تفاعلياً.\n\nجاري تشغيل محرك الاختبار الآن...", parse_mode="Markdown")
-        await asyncio.sleep(1.2)
-        await send_current_question(update.effective_chat.id, context)
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "mode_quiz_prompt") + "\n\n" + ai_queue_status_text())
+
+async def pp_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    await safe_edit(query, "📂 بنك الامتحانات (السنوات السابقة)\n\nاختر الجامعة:", reply_markup=past_home_keyboard())
+
+async def pp_uni_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    parts = data.split(":")
+    uni = parts[2] if len(parts) >= 3 else "ajdabiya"
+    title = UNI_LABELS.get(uni, uni)
+    await safe_edit(query, f"🏛️ {title}\n\nاختر المادة:", reply_markup=past_subjects_keyboard(uni))
+
+async def pp_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    parts = data.split(":")
+    if len(parts) < 4:
+        return await pp_home_callback(update, context)
+    uni, subject = parts[2], parts[3]
+    questions = await pp_load_questions(uni, subject)
+    user_id = query.from_user.id if query.from_user else update.effective_chat.id
+    prog = await pp_get_progress(user_id, uni, subject)
+    attempts = int(prog.get("attempts") or 0)
+    correct = int(prog.get("correct") or 0)
+    wrong = int(prog.get("wrong") or 0)
+    pct = round(correct / attempts * 100) if attempts else 0
+    text = (
+        f"🏛️ {UNI_LABELS.get(uni, uni)}\n"
+        f"📚 {SUBJECT_LABELS.get(subject, subject)}\n\n"
+        f"📊 عدد الأسئلة المحفوظة: {len(questions)}\n"
+        f"✅ الصحيحة: {correct}\n"
+        f"❌ الخاطئة: {wrong}\n"
+        f"📈 النسبة: {pct}%\n\n"
+        f"اختر طريقة التدريب:"
+    )
+    await safe_edit(query, text, reply_markup=pp_subject_menu_keyboard(uni, subject))
+
+async def pp_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, uni: str, subject: str, mode: str):
+    query = update.callback_query
+    questions = await pp_load_questions(uni, subject)
+    if not questions:
+        return await safe_edit(query, f"🚧 لا توجد أسئلة محفوظة حالياً في مادة:\n{SUBJECT_LABELS.get(subject, subject)}\n\nارفع أسئلة من لوحة الأدمن ثم جرّب مرة ثانية.", reply_markup=pp_subject_menu_keyboard(uni, subject))
+    if mode == "random":
+        selected = [random.choice(questions)]
+    elif mode == "seq":
+        selected = questions
+    elif mode == "quiz":
+        selected = random.sample(questions, min(20, len(questions)))
+    else:
+        selected = questions
+    context.user_data["session"] = {
+        "quiz_id": str(uuid.uuid4())[:8],
+        "questions": [shuffle_options(q) for q in selected],
+        "current": 0,
+        "score": 0,
+        "wrong": [],
+        "level": f"past:{uni}:{subject}:{mode}",
+    }
+    await safe_edit(query, f"✅ بدأ التدريب\n🏛️ {UNI_LABELS.get(uni, uni)}\n📚 {SUBJECT_LABELS.get(subject, subject)}\n📝 عدد الأسئلة: {len(selected)}")
+    await asyncio.sleep(0.3)
+    await send_current_question(update.effective_chat.id, context)
+
+async def pp_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    parts = data.split(":")
+    if len(parts) < 5:
+        return await pp_home_callback(update, context)
+    mode, uni, subject = parts[2], parts[3], parts[4]
+    await pp_start_session(update, context, uni, subject, mode)
+
+async def pp_quiz_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    parts = data.split(":")
+    if len(parts) < 4:
+        return await pp_home_callback(update, context)
+    await pp_start_session(update, context, parts[2], parts[3], "quiz")
+
+async def pp_wrong_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    parts = data.split(":")
+    if len(parts) < 4:
+        return await pp_home_callback(update, context)
+    uni, subject = parts[2], parts[3]
+    user_id = query.from_user.id if query.from_user else update.effective_chat.id
+    prog = await pp_get_progress(user_id, uni, subject)
+    try:
+        wrong_list = json.loads(prog.get("wrong_json") or "[]")
+    except Exception:
+        wrong_list = []
+    wrong_list = [_pp_normalize_question(q) for q in wrong_list]
+    wrong_list = [q for q in wrong_list if q]
+    if not wrong_list:
+        return await safe_edit(query, "✅ لا توجد أسئلة خاطئة محفوظة للمراجعة في هذه المادة.", reply_markup=pp_subject_menu_keyboard(uni, subject))
+    context.user_data["session"] = {
+        "quiz_id": str(uuid.uuid4())[:8],
+        "questions": [shuffle_options(q) for q in wrong_list],
+        "current": 0,
+        "score": 0,
+        "wrong": [],
+        "level": f"past:{uni}:{subject}:wrong_review",
+    }
+    await safe_edit(query, f"❌ مراجعة الأخطاء\nعدد الأسئلة: {len(wrong_list)}")
+    await asyncio.sleep(0.3)
+    await send_current_question(update.effective_chat.id, context)
+
+async def pp_progress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    parts = data.split(":")
+    if len(parts) < 4:
+        return await pp_home_callback(update, context)
+    uni, subject = parts[2], parts[3]
+    user_id = query.from_user.id if query.from_user else update.effective_chat.id
+    prog = await pp_get_progress(user_id, uni, subject)
+    attempts = int(prog.get("attempts") or 0)
+    correct = int(prog.get("correct") or 0)
+    wrong = int(prog.get("wrong") or 0)
+    pct = round(correct / attempts * 100) if attempts else 0
+    await safe_edit(query, f"📊 تقدمي في المادة\n\n🏛️ {UNI_LABELS.get(uni, uni)}\n📚 {SUBJECT_LABELS.get(subject, subject)}\n\n📝 محاولات الحل: {attempts}\n✅ الصحيحة: {correct}\n❌ الخاطئة: {wrong}\n📈 النسبة: {pct}%", reply_markup=pp_subject_menu_keyboard(uni, subject))
+
+# Placeholder for old callback compatibility
+async def pp_answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await answer_callback(update, context)
+
+async def pp_quiz_next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await pp_quiz_start_callback(update, context)
 
 async def summary_style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); style = query.data.split(":", 1)[1]
-    if style in SUMMARY_PROMPTS: context.user_data.update({"pending_summary_style": style, "pending_mode": "summary"}); await query.edit_message_reply_markup(reply_markup=None); await context.bot.send_message(update.effective_chat.id, t(context.user_data, "mode_summary_prompt"))
+    query = update.callback_query; await safe_answer_query(query); style = query.data.split(":", 1)[1]
+    if style in SUMMARY_PROMPTS:
+        context.user_data.update({"pending_summary_style": style, "pending_mode": "summary"})
+        try: await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "mode_summary_prompt"))
 
 async def level_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); parts = query.data.split(":")
+    query = update.callback_query; await safe_answer_query(query); parts = query.data.split(":")
     if len(parts) != 3: return
     setup_id, level = parts[1], parts[2]
     pending = context.user_data.get("pending_file")
-    if not pending or pending.get("setup_id") != setup_id: return await query.edit_message_text(t(context.user_data, "stale"))
+    if not pending or pending.get("setup_id") != setup_id: return await safe_edit(query, t(context.user_data, "stale"))
     if level not in LEVEL_LIMITS or not await check_daily_limit(update, context, level): return
     pending["level"] = level
-    if level == "basic": await query.edit_message_text(t(context.user_data, "basic_count_prompt"), reply_markup=basic_count_keyboard(setup_id))
-    else: await query.edit_message_text(t(context.user_data, "generating_pool")); await start_quiz_from_bank(update, context, setup_id, level, LEVEL_LIMITS[level])
+    if level == "basic": await safe_edit(query, t(context.user_data, "basic_count_prompt"), reply_markup=basic_count_keyboard(setup_id))
+    else: await safe_edit(query, t(context.user_data, "generating_pool")); await start_quiz_from_bank(update, context, setup_id, level, LEVEL_LIMITS[level])
 
 async def count_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); parts = query.data.split(":")
+    query = update.callback_query; await safe_answer_query(query); parts = query.data.split(":")
     if len(parts) != 3: return
     try: count = int(parts[2])
     except Exception: return
     if count not in BASIC_COUNTS: return
     pending = context.user_data.get("pending_file")
-    if not pending or pending.get("setup_id") != parts[1]: return await query.edit_message_text(t(context.user_data, "stale"))
-    await query.edit_message_text(t(context.user_data, "generating_pool"))
+    if not pending or pending.get("setup_id") != parts[1]: return await safe_edit(query, t(context.user_data, "stale"))
+    await safe_edit(query, t(context.user_data, "generating_pool"))
     await start_quiz_from_bank(update, context, parts[1], "basic", count)
 
 async def start_quiz_from_bank(update: Update, context: ContextTypes.DEFAULT_TYPE, setup_id: str, level: str, requested_count: int):
     query = update.callback_query; pending = context.user_data.get("pending_file")
-    if not pending or pending.get("setup_id") != setup_id: return await query.edit_message_text(t(context.user_data, "stale"))
+    if not pending or pending.get("setup_id") != setup_id: return await safe_edit(query, t(context.user_data, "stale"))
     try:
         questions = await get_or_create_question_bank(pending["file_hash"], pending["text"], level)
-        if not questions: return await query.edit_message_text(t(context.user_data, "no_questions"))
+        if not questions: return await safe_edit(query, t(context.user_data, "no_questions"))
         pool = [shuffle_options(q) for q in questions]; random.shuffle(pool); selected = pool[:min(requested_count, len(pool))]
         if len(selected) < requested_count: await context.bot.send_message(update.effective_chat.id, t(context.user_data, "not_enough", n=len(selected)))
         context.user_data["session"] = {"quiz_id": str(uuid.uuid4())[:8], "questions": selected, "current": 0, "score": 0, "wrong": [], "level": level}; context.user_data.pop("pending_file", None)
-        await query.edit_message_text(t(context.user_data, "quiz_ready", n=len(selected)))
+        await safe_edit(query, t(context.user_data, "quiz_ready", n=len(selected)))
         await send_current_question(update.effective_chat.id, context)
         increment_daily_usage(context.user_data, level)
-    except Exception as e: await query.edit_message_text(t(context.user_data, "error", err=str(e)))
+    except Exception as e: await safe_edit(query, t(context.user_data, "error", err=str(e)))
 
 async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); parts = query.data.split(":")
+    query = update.callback_query; await safe_answer_query(query); parts = query.data.split(":")
     if len(parts) != 4: return
     quiz_id, chosen = parts[1], parts[3]
     try: idx = int(parts[2])
     except Exception: return
     session = context.user_data.get("session")
-    if not session or session.get("quiz_id") != quiz_id or session.get("current") != idx: return await query.edit_message_reply_markup(reply_markup=None)
+    if not session or session.get("quiz_id") != quiz_id or session.get("current") != idx:
+        try: return await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: return
     q, questions = session["questions"][idx], session["questions"]
-    if chosen == q["correct"]: session["score"] += 1; res = t(context.user_data, "correct")
+    is_correct = chosen == q["correct"]
+    if is_correct: session["score"] += 1; res = t(context.user_data, "correct")
     else: res = t(context.user_data, "wrong", chosen=chosen); session["wrong"].append({"question": q, "chosen": chosen})
+    level = session.get("level", "")
+    if isinstance(level, str) and level.startswith("past:"):
+        try:
+            _, uni, subject, *_ = level.split(":")
+            user_id = query.from_user.id if query.from_user else update.effective_chat.id
+            await pp_record_answer(user_id, uni, subject, q, is_correct)
+        except Exception:
+            logger.exception("failed to record past paper progress")
     feedback = f"{format_question(q, idx + 1, len(questions), context.user_data)}\n\n{escape_md(res)}\n{t(context.user_data, 'answer')} {q['correct']}. {escape_md(q['options'].get(q['correct'], ''))}\n\n{t(context.user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
     chunks = [feedback[i:i + 4000] for i in range(0, len(feedback), 4000)]
     try: await query.edit_message_text(chunks[0], parse_mode="Markdown")
-    except Exception: await query.edit_message_reply_markup(reply_markup=None); await context.bot.send_message(update.effective_chat.id, chunks[0].replace("", ""))
-    for c in chunks[1:]: await context.bot.send_message(update.effective_chat.id, c.replace("", ""))
-    session["current"] += 1; await asyncio.sleep(0.4)
+    except Exception:
+        try: await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        await context.bot.send_message(update.effective_chat.id, chunks[0].replace("`", ""))
+    for c in chunks[1:]: await context.bot.send_message(update.effective_chat.id, c.replace("`", ""))
+    session["current"] += 1; await asyncio.sleep(0.25)
     if session["current"] >= len(questions): await send_final_score(update.effective_chat.id, context)
     else: await send_current_question(update.effective_chat.id, context)
 
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); action = query.data.split(":", 1)[1]
+    query = update.callback_query; await safe_answer_query(query); action = query.data.split(":", 1)[1]
     if action == "start":
-        if not context.user_data.get("review_pool"): return await query.edit_message_text(t(context.user_data, "review_none"))
+        if not context.user_data.get("review_pool"): return await safe_edit(query, t(context.user_data, "review_none"))
         context.user_data["review"] = {"pool": context.user_data["review_pool"], "current": 0}
-        await query.edit_message_reply_markup(reply_markup=None); await send_review(update.effective_chat.id, context)
+        try: await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        await send_review(update.effective_chat.id, context)
     elif action == "next" and context.user_data.get("review"):
-        context.user_data["review"]["current"] += 1; await query.edit_message_reply_markup(reply_markup=None); await send_review(update.effective_chat.id, context)
+        context.user_data["review"]["current"] += 1
+        try: await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        await send_review(update.effective_chat.id, context)
     elif action == "exit":
-        context.user_data.pop("review", None); await query.edit_message_reply_markup(reply_markup=None); await context.bot.send_message(update.effective_chat.id, t(context.user_data, "review_done"))
+        context.user_data.pop("review", None)
+        try: await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "review_done"))
     elif action == "stats":
-        await query.edit_message_reply_markup(reply_markup=None); stats = get_stats(context.user_data)
+        try: await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        stats = get_stats(context.user_data)
         await context.bot.send_message(update.effective_chat.id, t(context.user_data, "stats_text", quizzes=stats["quizzes"], correct=stats["correct"], total=stats["total"], accuracy=round(stats["correct"] / stats["total"] * 100) if stats["total"] else 0, best=stats["best"]))
     elif action == "new":
-        await query.edit_message_reply_markup(reply_markup=None); await context.bot.send_message(update.effective_chat.id, t(context.user_data, "choose_mode"), reply_markup=mode_keyboard(context.user_data))
+        try: await query.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        await context.bot.send_message(update.effective_chat.id, t(context.user_data, "choose_mode"), reply_markup=mode_keyboard(context.user_data))
 
 async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     review = context.user_data.get("review")
@@ -1574,44 +1932,189 @@ async def send_review(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             if i == len(chunks) - 1: await context.bot.send_message(chat_id, c, parse_mode="Markdown", reply_markup=review_keyboard(current, len(pool)))
             else: await context.bot.send_message(chat_id, c, parse_mode="Markdown")
         except Exception:
-            if i == len(chunks) - 1: await context.bot.send_message(chat_id, c.replace("", ""), reply_markup=review_keyboard(current, len(pool)))
-            else: await context.bot.send_message(chat_id, c.replace("", ""))
+            if i == len(chunks) - 1: await context.bot.send_message(chat_id, c.replace("`", ""), reply_markup=review_keyboard(current, len(pool)))
+            else: await context.bot.send_message(chat_id, c.replace("`", ""))
 
 async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); await db_register_user(update.effective_user); action = query.data.split(":", 1)[1]
+    query = update.callback_query; await safe_answer_query(query); await db_register_user(update.effective_user); action = query.data.split(":", 1)[1]
+    if action == "support":
+        return await safe_edit(query, "📞 مركز الدعم\n\n📱 رقم المدار: 0918874659\n👤 تيليجرام: @Othma2003\n\nاختر:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 دعم عبر رصيد المدار", callback_data="support:balance")], [InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")], [InlineKeyboardButton("📢 أبلغ عن مشكلة", callback_data="support:problem")], [InlineKeyboardButton("⬅️ رجوع", callback_data="main:home")]]))
     if action == "progress":
         p = await db_get_progress(update.effective_user.id if update.effective_user else update.effective_chat.id)
         msg = f"📊 تقدمي ونقاطي\n\n⭐ XP: {p.get('xp', 0)}\n🎖 Level: {p.get('level', 1)}\n🔥 Streak: {p.get('streak', 0)} يوم\n📝 Quizzes: {p.get('quizzes', 0)}\n🎯 Accuracy: {round(int(p.get('correct') or 0) / int(p.get('total') or 1) * 100) if p.get('total') else 0}%\n🎭 OSCE completed: {p.get('osce_done', 0)}\n📚 Summaries: {p.get('summaries_done', 0)}\n\nكل اختبار/ملخص/OSCE يعطيك XP ويرفع مستواك."
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
+        await safe_edit(query, msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="main:home")]]))
     elif action == "leaderboard":
         rows = await db_get_leaderboard(10)
         lines = [f"{['🥇','🥈','🥉'][i] if i < 3 else f'{i+1}.'} {r.get('full_name') or r.get('username') or 'Student'} — ⭐ {r.get('xp', 0)} XP | 🎖 L{r.get('level', 1)} | 🔥 {r.get('streak', 0)}" for i, r in enumerate(rows)]
-        await query.edit_message_text("🏆 لوحة الصدارة\n\n" + ("\n".join(lines) if lines else "لا توجد نتائج بعد."), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
+        await safe_edit(query, "🏆 لوحة الصدارة\n\n" + ("\n".join(lines) if lines else "لا توجد نتائج بعد."), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="main:home")]]))
     elif action == "subscription":
-        await query.edit_message_text("💎 الاشتراك والدفع\n\nFree:\n• Basic محدود\n• Summary محدود\n• OSCE يومي محدود\n\nPremium قريباً:\n• حدود أعلى\n• أولوية\n\nللتفعيل اليدوي الآن: اضغط الدعم.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧾 طلب تفعيل / إرسال إثبات", callback_data="payment:request")], [InlineKeyboardButton("📞 الدعم", callback_data="back:support")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
+        await safe_edit(query, "💎 الاشتراك والدفع\n\nFree:\n• Basic محدود\n• Summary محدود\n• OSCE يومي محدود\n\nPremium قريباً:\n• حدود أعلى\n• أولوية\n\nللتفعيل اليدوي الآن: اضغط الدعم.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧾 طلب تفعيل / إرسال إثبات", callback_data="payment:request")], [InlineKeyboardButton("📞 الدعم", callback_data="panel:support")], [InlineKeyboardButton("⬅️ رجوع", callback_data="main:home")]]))
 
 async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
+    query = update.callback_query; await safe_answer_query(query)
     if update.effective_user:
         await db_register_user(update.effective_user)
         await db_create_payment_request(update.effective_user.id, "User opened payment request")
         await send_admin_log(context, f"💎 طلب اشتراك\nUser ID: {update.effective_user.id}\nName: {update.effective_user.full_name}")
-        await query.edit_message_text("🧾 تم فتح طلب اشتراك مبدئي.\nللتفعيل اليدوي: اضغط الدعم وأرسل إثبات الدفع.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📞 الدعم", callback_data="back:support")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
+    await safe_edit(query, "🧾 تم فتح طلب اشتراك مبدئي.\nللتفعيل اليدوي: اضغط الدعم وأرسل إثبات الدفع.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📞 الدعم", callback_data="panel:support")], [InlineKeyboardButton("⬅️ رجوع", callback_data="main:home")]]))
 
 async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); parts = query.data.split(":"); target = parts[1] if len(parts) > 1 else "mode"
-    if target == "mode": await query.edit_message_text(main_menu_text(context.user_data), reply_markup=mode_keyboard(context.user_data))
-    elif target == "support": await query.edit_message_text("📞 مركز الدعم\n\nاختر نوع الدعم:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 دعم عبر رصيد المدار", callback_data="support:balance")], [InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")], [InlineKeyboardButton("📢 أبلغ عن مشكلة", callback_data="support:problem")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:mode")]]))
+    query = update.callback_query
+    await safe_answer_query(query)
+    data = _safe_callback_data(query.data or "")
+    if data == "main:home":
+        return await show_main_menu(query, context)
+    parts = query.data.split(":")
+    target = parts[1] if len(parts) > 1 else "mode"
+    if target in ("mode", "main"):
+        await show_main_menu(query, context)
+    elif target == "support":
+        query.data = "panel:support"
+        await panel_callback(update, context)
     elif target == "levels" and len(parts) == 3:
         pending = context.user_data.get("pending_file")
-        if not pending or pending.get("setup_id") != parts[2]: return await query.edit_message_text(t(context.user_data, "stale"))
-        await query.edit_message_text(t(context.user_data, "file_ready_quiz"), reply_markup=level_keyboard(parts[2], context.user_data))
+        if not pending or pending.get("setup_id") != parts[2]: return await safe_edit(query, t(context.user_data, "stale"))
+        await safe_edit(query, t(context.user_data, "file_ready_quiz"), reply_markup=level_keyboard(parts[2], context.user_data))
+    else:
+        await show_main_menu(query, context)
 
 async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    if query.data == "support:balance": await query.edit_message_text("💳 دعم عبر رصيد المدار\n\nرقم المدار:\n0918874659\n\nبعد إرسال الرصيد، اضغط تواصل مع الدعم.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")], [InlineKeyboardButton("⬅️ رجوع", callback_data="back:support")]]))
-    elif query.data == "support:contact": context.user_data["awaiting_support_message"] = "contact"; await query.edit_message_text("💬 اكتب رسالتك الآن.\n\nمثال:\nاسمي أحمد، أرسلت رصيد، وأريد تفعيل الخدمة.")
-    elif query.data == "support:problem": context.user_data["awaiting_support_message"] = "problem"; await query.edit_message_text("📢 اكتب المشكلة التي تواجهك الآن.")
+    query = update.callback_query; await safe_answer_query(query)
+    if query.data == "support:balance": await safe_edit(query, "💳 دعم عبر رصيد المدار\n\nرقم المدار:\n0918874659\n\nبعد إرسال الرصيد، اضغط تواصل مع الدعم.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")], [InlineKeyboardButton("⬅️ رجوع", callback_data="panel:support")]]))
+    elif query.data == "support:contact": context.user_data["awaiting_support_message"] = "contact"; await safe_edit(query, "💬 اكتب رسالتك الآن.\n\nمثال:\nاسمي أحمد، أرسلت رصيد، وأريد تفعيل الخدمة.")
+    elif query.data == "support:problem": context.user_data["awaiting_support_message"] = "problem"; await safe_edit(query, "📢 اكتب المشكلة التي تواجهك الآن.")
+
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await safe_answer_query(query)
+    if not is_admin_user(query.from_user.id if query.from_user else None):
+        return await safe_edit(query, "⛔ هذه اللوحة للإدارة فقط.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع", callback_data="main:home")]]))
+    data = query.data or "admin:home"
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else "home"
+    if action == "home":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ إضافة أسئلة للمخزون", callback_data="admin:add")],
+            [InlineKeyboardButton("📦 أعطيني المخزون ZIP", callback_data="admin:dumpzip")],
+            [InlineKeyboardButton("🧹 تفريغ المخزون المؤقت", callback_data="admin:clear")],
+            [InlineKeyboardButton("❌ إلغاء التجميع الحالي", callback_data="admin:cancel")],
+            [InlineKeyboardButton("⬅️ رجوع للرئيسية", callback_data="main:home")],
+        ])
+        st = context.user_data.get("active_staging")
+        active = f"\n\n📥 التجميع الحالي: {st['uni']} / {st['subject']}" if st else "\n\nلا يوجد تجميع نشط الآن."
+        return await safe_edit(query, "🛠️ لوحة الأدمن\n" + active, reply_markup=kb)
+    if action == "add":
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏛️ أجدابيا", callback_data="admin:adduni:ajdabiya")], [InlineKeyboardButton("🏛️ بنغازي", callback_data="admin:adduni:benghazi")], [InlineKeyboardButton("⬅️ رجوع", callback_data="admin:home")]])
+        return await safe_edit(query, "➕ إضافة أسئلة\n\nاختر الجامعة:", reply_markup=kb)
+    if action == "adduni" and len(parts) >= 3:
+        uni = parts[2]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"admin:addsubject:{uni}:{sub}")] for sub, label in PAST_SUBJECTS] + [[InlineKeyboardButton("⬅️ رجوع", callback_data="admin:add")]])
+        return await safe_edit(query, f"➕ إضافة أسئلة\n🏛️ {UNI_LABELS.get(uni, uni)}\n\nاختر المادة:", reply_markup=kb)
+    if action == "addsubject" and len(parts) >= 4:
+        uni, subject = parts[2], parts[3]
+        context.user_data["active_staging"] = {"uni": uni, "subject": subject}
+        return await safe_edit(query, f"✅ بدأ التجميع المؤقت\n\n🏛️ {UNI_LABELS.get(uni, uni)}\n📚 {SUBJECT_LABELS.get(subject, subject)}\n\nأرسل الآن أي سؤال كنص، صورة، PDF، Word أو PPT.\nكل شيء ترسله سيتخزن في المخزون المؤقت.\n\nبعد الانتهاء اضغط من لوحة الأدمن: 📦 أعطيني المخزون ZIP", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠️ رجوع للوحة الأدمن", callback_data="admin:home")]]))
+    if action == "dumpzip":
+        await admin_send_staging_zip(update, context)
+        return
+    if action == "clear":
+        user_id = query.from_user.id
+        async with _db_lock:
+            def work():
+                conn = _db_connect(); conn.execute("DELETE FROM admin_staging WHERE user_id=?", (user_id,)); conn.commit(); conn.close()
+            await asyncio.to_thread(work)
+        context.user_data.pop("active_staging", None)
+        return await safe_edit(query, "🧹 تم تفريغ المخزون المؤقت.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠️ رجوع للوحة الأدمن", callback_data="admin:home")]]))
+    if action == "cancel":
+        context.user_data.pop("active_staging", None)
+        return await safe_edit(query, "❌ تم إلغاء وضع التجميع الحالي فقط.\nالمخزون المحفوظ لم يتم حذفه.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠️ رجوع للوحة الأدمن", callback_data="admin:home")]]))
+
+async def admin_send_staging_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    async with _db_lock:
+        def work():
+            conn = _db_connect()
+            rows = conn.execute("SELECT uni, subject, raw_content, created_at FROM admin_staging WHERE user_id=? ORDER BY uni, subject, created_at", (user_id,)).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        rows = await asyncio.to_thread(work)
+    if not rows:
+        return await safe_edit(query, "📦 المخزون المؤقت فارغ.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠️ رجوع للوحة الأدمن", callback_data="admin:home")]]))
+    grouped: Dict[Tuple[str, str], List[dict]] = {}
+    for r in rows:
+        grouped.setdefault((r["uni"], r["subject"]), []).append(r)
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        readme = "هذا ZIP صادر من بوت MedMCQ.\nنظف الأسئلة وحولها إلى JSON array بالشكل: question/options/correct/explanation.\nثم ارفع الناتج باستخدام /upload_final uni subject\n"
+        z.writestr("README.txt", readme)
+        for (uni, subject), items in grouped.items():
+            text = []
+            for i, item in enumerate(items, 1):
+                text.append(f"===== ITEM {i} | {item.get('created_at','')} =====\n{item.get('raw_content','')}")
+            z.writestr(f"{uni}/{subject}/raw_questions.txt", "\n\n".join(text))
+    mem.seek(0)
+    mem.name = f"admin_staging_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+    await context.bot.send_document(chat_id=update.effective_chat.id, document=mem, caption="📦 هذا مخزون الأسئلة بصيغة ZIP. أرسله لـ ChatGPT لتنظيفه وتحويله إلى JSON.")
+    await safe_edit(query, "✅ تم إرسال ZIP.\nالمخزون لم يُحذف. إذا تريد حذفه اضغط: تفريغ المخزون المؤقت.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧹 تفريغ المخزون المؤقت", callback_data="admin:clear")], [InlineKeyboardButton("🛠️ رجوع للوحة الأدمن", callback_data="admin:home")]]))
+
+async def universal_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    raw_data = query.data or ""
+    data = _safe_callback_data(raw_data)
+    query.data = data
+    try:
+        if data.startswith("lang:"):
+            await lang_callback(update, context)
+        elif data == "main:home" or data.startswith("back:"):
+            await back_callback(update, context)
+        elif data.startswith("admin:"):
+            await admin_panel_callback(update, context)
+        elif data == "pp:home":
+            await pp_home_callback(update, context)
+        elif data.startswith("pp:uni:"):
+            await pp_uni_callback(update, context)
+        elif data.startswith("pp:subject:"):
+            await pp_sub_callback(update, context)
+        elif data.startswith("pp:mode:"):
+            await pp_mode_callback(update, context)
+        elif data.startswith("pp:quiz:"):
+            await pp_quiz_start_callback(update, context)
+        elif data.startswith("pp:wrong:"):
+            await pp_wrong_callback(update, context)
+        elif data.startswith("pp:progress:"):
+            await pp_progress_callback(update, context)
+        elif data.startswith("mode:"):
+            await mode_callback(update, context)
+        elif data.startswith("panel:"):
+            await panel_callback(update, context)
+        elif data.startswith("style:"):
+            await summary_style_callback(update, context)
+        elif data.startswith("level:"):
+            await level_callback(update, context)
+        elif data.startswith("count:"):
+            await count_callback(update, context)
+        elif data.startswith("ans:"):
+            await answer_callback(update, context)
+        elif data.startswith("review:"):
+            await review_callback(update, context)
+        elif data.startswith("payment:"):
+            await payment_callback(update, context)
+        elif data.startswith("support:"):
+            await support_callback(update, context)
+        elif data.startswith("osce4:"):
+            await osce_v4_callback(update, context)
+        else:
+            await safe_answer_query(query)
+            await safe_edit(query, f"⚠️ زر غير معروف أو قديم.\n\nالكود: {raw_data}\n\nافتح /start من جديد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع للرئيسية", callback_data="main:home")]]))
+    except ApplicationHandlerStop:
+        raise
+    except Exception as e:
+        logger.exception("callback router error for data=%s", raw_data)
+        await safe_answer_query(query)
+        await safe_edit(query, f"⚠️ حدث خطأ تلقائي وتم احتواؤه.\n\nالزر: {raw_data}\nالخطأ: {str(e)[:300]}\n\nاضغط رجوع للرئيسية وجرب مرة ثانية.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع للرئيسية", callback_data="main:home")]]))
+    finally:
+        raise ApplicationHandlerStop
 
 async def send_admin_log(context: ContextTypes.DEFAULT_TYPE, text: str):
     try: await context.bot.send_message(chat_id=ADMIN_LOG_CHAT_ID, text=text)
@@ -1809,21 +2312,8 @@ def main():
     application.add_handler(CommandHandler("stage_dump", stage_dump_cmd))
     application.add_handler(CommandHandler("upload_final", upload_final_cmd))
 
-    application.add_handler(CallbackQueryHandler(lang_callback, pattern=r"^lang:"))
-    application.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
-    application.add_handler(CallbackQueryHandler(pp_uni_callback, pattern=r"^pp_uni:"))
-    application.add_handler(CallbackQueryHandler(pp_sub_callback, pattern=r"^pp_sub:"))
-    application.add_handler(CallbackQueryHandler(summary_style_callback, pattern=r"^style:"))
-    application.add_handler(CallbackQueryHandler(level_callback, pattern=r"^level:"))
-    application.add_handler(CallbackQueryHandler(count_callback, pattern=r"^count:"))
-    application.add_handler(CallbackQueryHandler(answer_callback, pattern=r"^ans:"))
-    application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
-    application.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^panel:"))
-    # استبدال معالج OSCE القديم بمعالج OSCE V4
-    application.add_handler(CallbackQueryHandler(osce_v4_callback, pattern=r"^osce4:"))
-    application.add_handler(CallbackQueryHandler(payment_callback, pattern=r"^payment:"))
-    application.add_handler(CallbackQueryHandler(support_callback, pattern=r"^support:"))
-    application.add_handler(CallbackQueryHandler(back_callback, pattern=r"^back:"))
+    # Unified callback router: all buttons pass through one protected handler.
+    application.add_handler(CallbackQueryHandler(universal_callback_router, pattern=r".*"), group=-100)
 
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
