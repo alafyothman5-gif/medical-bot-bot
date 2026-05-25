@@ -210,12 +210,19 @@ TRANSLATIONS = {
 }
 
 def get_lang(user_data: dict) -> str:
+    """Return language safely even if corrupted user_data is not a dict."""
+    if not isinstance(user_data, dict):
+        user_data = {}
     lang = user_data.get("lang", "ar")
     return lang if lang in SUPPORTED_LANGS else "ar"
 
 def t(user_data: dict, key: str, **kwargs) -> str:
+    """Safe translation helper."""
+    if not isinstance(user_data, dict):
+        user_data = {}
     lang = get_lang(user_data)
-    text = TRANSLATIONS.get(lang, TRANSLATIONS["ar"]).get(key, key)
+    base = TRANSLATIONS.get(lang, TRANSLATIONS.get("ar", {}))
+    text = base.get(key, key) if isinstance(base, dict) else str(key)
     try:
         return text.format(**kwargs)
     except Exception:
@@ -503,7 +510,8 @@ async def call_gemini(prompt: str, temperature: float = 0.2, max_output_tokens: 
             async with aiohttp.ClientSession() as session:
                 async with session.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120) as response:
                     if response.status == 200: return (await response.json())["choices"][0]["message"]["content"].strip()
-                    raise Exception(f"HTTP {response.status}: {await response.text()[:300]}")
+                    err_text = await response.text()
+                    raise Exception(f"HTTP {response.status}: {err_text[:300]}")
         finally:
             async with _AI_QUEUE_LOCK: _ACTIVE_AI_JOBS = max(0, _ACTIVE_AI_JOBS - 1)
 
@@ -570,42 +578,134 @@ SUMMARY_PROMPTS = {
 }
 
 def extract_json_array(raw: str) -> Optional[list]:
+    """Extract a JSON array from AI output safely."""
     raw = (raw or "").strip()
-    try: return json.loads(raw) if isinstance(json.loads(raw), list) else None
-    except Exception: pass
-    raw = raw.replace("json", "").replace("", "").strip()
-    match = re.search(r"[.*]", raw, flags=re.DOTALL)
+    if not raw:
+        return None
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, dict):
+            for key in ("questions", "items", "data"):
+                if isinstance(obj.get(key), list):
+                    return obj[key]
+    except Exception:
+        pass
+    match = re.search(r"\[[\s\S]*\]", raw)
     if match:
-        try: return json.loads(match.group(0)) if isinstance(json.loads(match.group(0)), list) else None
-        except Exception: pass
+        try:
+            obj = json.loads(match.group(0))
+            return obj if isinstance(obj, list) else None
+        except Exception:
+            return None
     return None
 
-def normalize_questions(items: list) -> List[dict]:
-    clean = []
+def _normalize_options(options: Any) -> Dict[str, str]:
+    """Convert options from dict/list formats to A-E dict."""
+    letters = list("ABCDE")
+    out: Dict[str, str] = {}
+    if isinstance(options, dict):
+        for letter in letters:
+            val = options.get(letter) or options.get(letter.lower()) or options.get(str(letter))
+            if val is not None and str(val).strip():
+                out[letter] = str(val).strip()
+    elif isinstance(options, list):
+        for idx, item in enumerate(options[:5]):
+            if idx >= len(letters):
+                break
+            if isinstance(item, dict):
+                val = (
+                    item.get("text")
+                    or item.get("option")
+                    or item.get("value")
+                    or item.get("answer")
+                    or item.get("label")
+                    or next(iter(item.values()), "")
+                )
+            else:
+                val = item
+            if val is not None and str(val).strip():
+                out[letters[idx]] = str(val).strip()
+    return out
+
+def normalize_questions(items: Any) -> List[dict]:
+    """Normalize AI/cached questions so the rest of the bot never crashes on list/dict mismatch."""
+    if isinstance(items, dict):
+        for key in ("questions", "items", "data"):
+            if isinstance(items.get(key), list):
+                items = items[key]
+                break
+        else:
+            items = [items]
+    if not isinstance(items, list):
+        return []
+
+    clean: List[dict] = []
+    letters = list("ABCDE")
+
     for q in items:
-        if not isinstance(q, dict): continue
-        question, options, correct, explanation = str(q.get("question", "")).strip(), q.get("options"), str(q.get("correct", "")).strip().upper(), str(q.get("explanation", "")).strip()
-        if not question or not isinstance(options, dict) or correct not in ["A", "B", "C", "D", "E"]: continue
-        norm_opts = {}; ok = True
-        for letter in ["A", "B", "C", "D"]:
-            val = str(options.get(letter, "")).strip()
-            if not val: ok = False; break
-            norm_opts[letter] = val
-        if not ok: continue
-        e_val = str(options.get("E", "")).strip()
-        norm_opts["E"] = e_val if e_val else "None of the above"
-        clean.append({"question": question, "options": norm_opts, "correct": correct, "explanation": explanation or "Based on lecture text."})
+        if not isinstance(q, dict):
+            continue
+
+        question = str(q.get("question") or q.get("stem") or q.get("q") or "").strip()
+        options = _normalize_options(q.get("options") or q.get("choices") or q.get("answers") or [])
+        correct = str(q.get("correct") or q.get("answer") or q.get("correct_answer") or "").strip().upper()
+        explanation = str(q.get("explanation") or q.get("rationale") or "Based on lecture text.").strip()
+
+        if correct not in letters and correct:
+            for letter, value in options.items():
+                if correct.lower() == str(value).strip().lower():
+                    correct = letter
+                    break
+
+        if not question or correct not in letters:
+            continue
+
+        if len([v for v in options.values() if str(v).strip()]) < 4:
+            continue
+        missing_required = False
+        for letter in "ABCD":
+            if letter not in options or not str(options[letter]).strip():
+                missing_required = True
+                break
+        if missing_required:
+            continue
+        if "E" not in options or not str(options["E"]).strip():
+            options["E"] = "None of the above"
+
+        clean.append({
+            "question": question,
+            "options": {letter: options.get(letter, "") for letter in letters},
+            "correct": correct,
+            "explanation": explanation or "Based on lecture text.",
+        })
+
     return clean
 
 def shuffle_options(q: dict) -> dict:
-    letters, opts, correct = list("ABCDE"), q.get("options", {}), q.get("correct", "").upper()
-    if correct not in letters or any(l not in opts for l in letters): return q
-    pairs = [(opts[l], l == correct) for l in letters]; random.shuffle(pairs)
+    nq = normalize_questions([q])
+    if not nq:
+        return {}
+    q = nq[0]
+    letters = list("ABCDE")
+    opts = q.get("options", {})
+    correct = q.get("correct", "").upper()
+    if correct not in letters or any(l not in opts for l in letters):
+        return q
+    pairs = [(opts[l], l == correct) for l in letters]
+    random.shuffle(pairs)
     new_opts, new_correct = {}, "A"
     for idx, (text, is_correct) in enumerate(pairs):
-        letter = letters[idx]; new_opts[letter] = text
-        if is_correct: new_correct = letter
-    q = dict(q); q["options"] = new_opts; q["correct"] = new_correct; return q
+        letter = letters[idx]
+        new_opts[letter] = text
+        if is_correct:
+            new_correct = letter
+    q = dict(q)
+    q["options"] = new_opts
+    q["correct"] = new_correct
+    return q
 
 def split_text(text: str, chunk_size: int = 10000) -> List[str]:
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
@@ -1371,12 +1471,40 @@ def main_menu_text(user_data: dict) -> str:
     return "🩺 MedMCQ AI Academy\n━━━━━━━━━━━━━━\nYour smart medical learning platform.\n\nChoose a service:\n📝 Interactive quizzes\n📚 AI summaries\n🎭 Smart OSCE\n📂 Past papers\n📊 XP, levels\n🏆 Leaderboard\n💎 Subscription"
 
 def format_question(q: dict, idx: int, total: int, user_data: dict) -> str:
-    opts = q.get("options", {})
-    return f"{progress_bar(idx, total)}\n{t(user_data, 'q_meta', i=idx, n=total)}\n\n{escape_md(q.get('question', ''))}\n\nA. {escape_md(opts.get('A', ''))}\nB. {escape_md(opts.get('B', ''))}\nC. {escape_md(opts.get('C', ''))}\nD. {escape_md(opts.get('D', ''))}\nE. {escape_md(opts.get('E', ''))}"
+    nq = normalize_questions([q])
+    q = nq[0] if nq else {"question": "", "options": {}, "correct": "", "explanation": ""}
+    opts = _normalize_options(q.get("options", {}))
+    for letter in "ABCDE":
+        opts.setdefault(letter, "")
+    return (
+        f"{progress_bar(idx, total)}\n{t(user_data, 'q_meta', i=idx, n=total)}\n\n"
+        f"{escape_md(q.get('question', ''))}\n\n"
+        f"A. {escape_md(opts.get('A', ''))}\n"
+        f"B. {escape_md(opts.get('B', ''))}\n"
+        f"C. {escape_md(opts.get('C', ''))}\n"
+        f"D. {escape_md(opts.get('D', ''))}\n"
+        f"E. {escape_md(opts.get('E', ''))}"
+    )
 
 def format_review(entry: dict, idx: int, total: int, user_data: dict) -> str:
-    q, chosen = entry["question"], entry["chosen"]
-    return f"📋 Review {idx}/{total}\n\n{escape_md(q['question'])}\n\nA. {escape_md(q['options']['A'])}\nB. {escape_md(q['options']['B'])}\nC. {escape_md(q['options']['C'])}\nD. {escape_md(q['options']['D'])}\nE. {escape_md(q['options']['E'])}\n\nYour answer: {chosen}\nCorrect answer: {q['correct']}. {escape_md(q['options'][q['correct']])}\n\n{t(user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
+    q = entry.get("question", {}) if isinstance(entry, dict) else {}
+    chosen = entry.get("chosen", "") if isinstance(entry, dict) else ""
+    nq = normalize_questions([q])
+    q = nq[0] if nq else {"question": "", "options": {}, "correct": "", "explanation": ""}
+    opts = _normalize_options(q.get("options", {}))
+    correct = q.get("correct", "")
+    correct_text = opts.get(correct, "")
+    return (
+        f"📋 Review {idx}/{total}\n\n{escape_md(q.get('question', ''))}\n\n"
+        f"A. {escape_md(opts.get('A', ''))}\n"
+        f"B. {escape_md(opts.get('B', ''))}\n"
+        f"C. {escape_md(opts.get('C', ''))}\n"
+        f"D. {escape_md(opts.get('D', ''))}\n"
+        f"E. {escape_md(opts.get('E', ''))}\n\n"
+        f"Your answer: {chosen}\n"
+        f"Correct answer: {correct}. {escape_md(correct_text)}\n\n"
+        f"{t(user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
+    )
 
 # =============================================================================
 # SENDERS & COMMANDS
@@ -1390,20 +1518,37 @@ async def safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
 
 async def send_current_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = context.user_data.get("session")
-    if not session: return
-    idx, questions = session["current"], session["questions"]
-    if idx >= len(questions): await send_final_score(chat_id, context); return
-    await safe_send(context.bot, chat_id, format_question(questions[idx], idx + 1, len(questions), context.user_data), parse_mode="Markdown", reply_markup=answer_keyboard(session["quiz_id"], idx))
+    if not isinstance(session, dict):
+        return
+    idx = int(session.get("current", 0))
+    questions = normalize_questions(session.get("questions", []))
+    session["questions"] = questions
+    if idx >= len(questions):
+        await send_final_score(chat_id, context)
+        return
+    await safe_send(
+        context.bot,
+        chat_id,
+        format_question(questions[idx], idx + 1, len(questions), context.user_data),
+        parse_mode="Markdown",
+        reply_markup=answer_keyboard(session["quiz_id"], idx),
+    )
 
 async def send_final_score(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = context.user_data.get("session")
-    if not session: return
-    total, score, wrong = len(session["questions"]), session["score"], session.get("wrong", [])
+    if not isinstance(session, dict):
+        return
+    questions = normalize_questions(session.get("questions", []))
+    session["questions"] = questions
+    total = len(questions)
+    score = int(session.get("score", 0))
+    wrong = session.get("wrong", [])
     update_stats(context.user_data, score, total)
     xp_points = 25 + (score * 10) + (20 if total and (score / total) >= 0.8 else 0)
     progress = await db_add_xp(chat_id, xp_points, "Quiz completed", correct=score, total=total, quiz_done=True)
     text = t(context.user_data, "complete", score=score, total=total, pct=round(score / total * 100) if total else 0) + f"\n\n⭐ +{xp_points} XP | 🎖 Level {progress.get('level', 1)} | 🔥 Streak {progress.get('streak', 0)}"
-    if progress.get("leveled_up"): text += "\n🎉 Level up! ممتاز، استمر."
+    if progress.get("leveled_up"):
+        text += "\n🎉 Level up! ممتاز، استمر."
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=post_quiz_keyboard(context.user_data, bool(wrong)))
     context.user_data["review_pool"] = wrong
     context.user_data.pop("session", None)
@@ -1832,6 +1977,22 @@ async def level_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if level == "basic": await safe_edit(query, t(context.user_data, "basic_count_prompt"), reply_markup=basic_count_keyboard(setup_id))
     else: await safe_edit(query, t(context.user_data, "generating_pool")); await start_quiz_from_bank(update, context, setup_id, level, LEVEL_LIMITS[level])
 
+
+def load_pending_quiz_from_redis(user_id: int, setup_id: str):
+    try:
+        import json
+        from queue_jobs import r
+        raw = r.get(f"medical_bot:pending_quiz:{user_id}:{setup_id}")
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        try:
+            logger.exception("load_pending_quiz_from_redis failed")
+        except Exception:
+            pass
+    return None
+
+
 async def count_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await safe_answer_query(query); parts = query.data.split(":")
     if len(parts) != 3: return
@@ -1839,38 +2000,94 @@ async def count_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: return
     if count not in BASIC_COUNTS: return
     pending = context.user_data.get("pending_file")
+    if (not pending or pending.get("setup_id") != parts[1]) and update.effective_user:
+        pending = load_pending_quiz_from_redis(update.effective_user.id, parts[1])
+        if pending:
+            context.user_data["pending_file"] = pending
     if not pending or pending.get("setup_id") != parts[1]: return await safe_edit(query, t(context.user_data, "stale"))
     await safe_edit(query, t(context.user_data, "generating_pool"))
     await start_quiz_from_bank(update, context, parts[1], "basic", count)
 
 async def start_quiz_from_bank(update: Update, context: ContextTypes.DEFAULT_TYPE, setup_id: str, level: str, requested_count: int):
-    query = update.callback_query; pending = context.user_data.get("pending_file")
-    if not pending or pending.get("setup_id") != setup_id: return await safe_edit(query, t(context.user_data, "stale"))
+    """Start quiz directly without worker/Redis queue. Stable version."""
+    query = update.callback_query
+    pending = context.user_data.get("pending_file")
+    if not isinstance(pending, dict) or pending.get("setup_id") != setup_id:
+        return await safe_edit(query, t(context.user_data, "stale"))
+
     try:
+        await safe_edit(query, t(context.user_data, "generating_pool"))
+
         questions = await get_or_create_question_bank(pending["file_hash"], pending["text"], level)
-        if not questions: return await safe_edit(query, t(context.user_data, "no_questions"))
-        pool = [shuffle_options(q) for q in questions]; random.shuffle(pool); selected = pool[:min(requested_count, len(pool))]
-        if len(selected) < requested_count: await context.bot.send_message(update.effective_chat.id, t(context.user_data, "not_enough", n=len(selected)))
-        context.user_data["session"] = {"quiz_id": str(uuid.uuid4())[:8], "questions": selected, "current": 0, "score": 0, "wrong": [], "level": level}; context.user_data.pop("pending_file", None)
+        questions = normalize_questions(questions)
+
+        if not questions:
+            return await safe_edit(query, "⚠️ لم أستطع توليد أسئلة من هذا الملف. جرب ملفاً أوضح أو اختر ملخص أولاً ثم أعد المحاولة.")
+
+        pool = [shuffle_options(q) for q in questions]
+        pool = [q for q in pool if q]
+        random.shuffle(pool)
+        selected = pool[:min(requested_count, len(pool))]
+
+        if len(selected) < requested_count:
+            await context.bot.send_message(update.effective_chat.id, t(context.user_data, "not_enough", n=len(selected)))
+
+        context.user_data["session"] = {
+            "quiz_id": str(uuid.uuid4())[:8],
+            "questions": selected,
+            "current": 0,
+            "score": 0,
+            "wrong": [],
+            "level": level,
+        }
+        context.user_data.pop("pending_file", None)
+
         await safe_edit(query, t(context.user_data, "quiz_ready", n=len(selected)))
         await send_current_question(update.effective_chat.id, context)
         increment_daily_usage(context.user_data, level)
-    except Exception as e: await safe_edit(query, t(context.user_data, "error", err=str(e)))
+
+    except Exception as e:
+        logger.exception("start_quiz_from_bank error")
+        await safe_edit(query, t(context.user_data, "error", err=str(e)))
 
 async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await safe_answer_query(query); parts = query.data.split(":")
-    if len(parts) != 4: return
+    query = update.callback_query
+    await safe_answer_query(query)
+    parts = query.data.split(":")
+    if len(parts) != 4:
+        return
     quiz_id, chosen = parts[1], parts[3]
-    try: idx = int(parts[2])
-    except Exception: return
+    try:
+        idx = int(parts[2])
+    except Exception:
+        return
+
     session = context.user_data.get("session")
-    if not session or session.get("quiz_id") != quiz_id or session.get("current") != idx:
-        try: return await query.edit_message_reply_markup(reply_markup=None)
-        except Exception: return
-    q, questions = session["questions"][idx], session["questions"]
-    is_correct = chosen == q["correct"]
-    if is_correct: session["score"] += 1; res = t(context.user_data, "correct")
-    else: res = t(context.user_data, "wrong", chosen=chosen); session["wrong"].append({"question": q, "chosen": chosen})
+    if not isinstance(session, dict) or session.get("quiz_id") != quiz_id or int(session.get("current", -1)) != idx:
+        try:
+            return await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            return
+
+    questions = normalize_questions(session.get("questions", []))
+    session["questions"] = questions
+    if idx < 0 or idx >= len(questions):
+        return
+
+    q = questions[idx]
+    opts = _normalize_options(q.get("options", {}))
+    correct_letter = q.get("correct", "")
+    is_correct = chosen == correct_letter
+
+    if is_correct:
+        session["score"] = int(session.get("score", 0)) + 1
+        res = t(context.user_data, "correct")
+    else:
+        res = t(context.user_data, "wrong", chosen=chosen)
+        wrong = session.setdefault("wrong", [])
+        if isinstance(wrong, list):
+            wrong.append({"question": q, "chosen": chosen})
+
     level = session.get("level", "")
     if isinstance(level, str) and level.startswith("past:"):
         try:
@@ -1879,17 +2096,31 @@ async def answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await pp_record_answer(user_id, uni, subject, q, is_correct)
         except Exception:
             logger.exception("failed to record past paper progress")
-    feedback = f"{format_question(q, idx + 1, len(questions), context.user_data)}\n\n{escape_md(res)}\n{t(context.user_data, 'answer')} {q['correct']}. {escape_md(q['options'].get(q['correct'], ''))}\n\n{t(context.user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
+
+    feedback = (
+        f"{format_question(q, idx + 1, len(questions), context.user_data)}\n\n"
+        f"{escape_md(res)}\n"
+        f"{t(context.user_data, 'answer')} {correct_letter}. {escape_md(opts.get(correct_letter, ''))}\n\n"
+        f"{t(context.user_data, 'explanation')} {escape_md(q.get('explanation', ''))}"
+    )
     chunks = [feedback[i:i + 4000] for i in range(0, len(feedback), 4000)]
-    try: await query.edit_message_text(chunks[0], parse_mode="Markdown")
+    try:
+        await query.edit_message_text(chunks[0], parse_mode="Markdown")
     except Exception:
-        try: await query.edit_message_reply_markup(reply_markup=None)
-        except Exception: pass
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         await context.bot.send_message(update.effective_chat.id, chunks[0].replace("`", ""))
-    for c in chunks[1:]: await context.bot.send_message(update.effective_chat.id, c.replace("`", ""))
-    session["current"] += 1; await asyncio.sleep(0.25)
-    if session["current"] >= len(questions): await send_final_score(update.effective_chat.id, context)
-    else: await send_current_question(update.effective_chat.id, context)
+    for c in chunks[1:]:
+        await context.bot.send_message(update.effective_chat.id, c.replace("`", ""))
+
+    session["current"] = int(session.get("current", 0)) + 1
+    await asyncio.sleep(0.25)
+    if session["current"] >= len(questions):
+        await send_final_score(update.effective_chat.id, context)
+    else:
+        await send_current_question(update.effective_chat.id, context)
 
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await safe_answer_query(query); action = query.data.split(":", 1)[1]
@@ -1969,8 +2200,15 @@ async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target in ("mode", "main"):
         await show_main_menu(query, context)
     elif target == "support":
-        query.data = "panel:support"
-        await panel_callback(update, context)
+        await safe_edit(
+            query,
+            "📞 الدعم\n\n💳 رقم المدار: 0918874659\n👤 للتواصل الشخصي: @Othma2003",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 دعم عبر رصيد المدار", callback_data="support:balance")],
+                [InlineKeyboardButton("💬 تواصل مع الدعم", callback_data="support:contact")],
+                [InlineKeyboardButton("⬅️ القائمة الرئيسية", callback_data="main:home")]
+            ])
+        )
     elif target == "levels" and len(parts) == 3:
         pending = context.user_data.get("pending_file")
         if not pending or pending.get("setup_id") != parts[2]: return await safe_edit(query, t(context.user_data, "stale"))
@@ -2062,7 +2300,7 @@ async def universal_callback_router(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     raw_data = query.data or ""
     data = _safe_callback_data(raw_data)
-    query.data = data
+    # removed invalid CallbackQuery.data assignment
     try:
         if data.startswith("lang:"):
             await lang_callback(update, context)
@@ -2296,7 +2534,7 @@ async def post_init(application: Application):
 
 def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
-    application = ApplicationBuilder().token(TOKEN).concurrent_updates(True).post_init(post_init).build()
+    application = ApplicationBuilder().token(TOKEN).concurrent_updates(False).post_init(post_init).build()
     application.add_error_handler(error_handler)
 
     application.add_handler(CommandHandler("start", start))
