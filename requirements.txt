@@ -1,8 +1,0 @@
-python-telegram-bot==21.8
-python-docx==1.1.2
-pypdf==4.3.1
-python-pptx
-lxml
-aiohttp
-redis==5.0.8
-python-dotenv==1.0.1
