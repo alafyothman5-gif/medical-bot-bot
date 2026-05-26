@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Almadar SMS Webhook
+Receives official SMS text forwarded from the admin phone via MacroDroid/SMS Forwarder.
+Matches: sender phone + amount + pending order, then activates Premium automatically.
+"""
+
+import asyncio
+import json
+import os
+import sys
+from typing import Optional
+
+import aiohttp
+from aiohttp import web
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+import bot
+
+HOST = os.environ.get("SMS_WEBHOOK_HOST", "0.0.0.0")
+PORT = int(os.environ.get("SMS_WEBHOOK_PORT", "8088"))
+TOKEN = os.environ.get("SMS_WEBHOOK_TOKEN", "CHANGE_ME_SMS_TOKEN").strip()
+
+
+def _auth_ok(request: web.Request) -> bool:
+    token = request.query.get("token", "").strip()
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
+    if not token:
+        token = request.headers.get("X-SMS-Token", "").strip()
+    return bool(token and token == TOKEN)
+
+
+async def _send_telegram_message(chat_id: int, text: str, reply_markup: Optional[dict] = None) -> None:
+    if not bot.TOKEN:
+        return
+    payload = {"chat_id": int(chat_id), "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    url = f"https://api.telegram.org/bot{bot.TOKEN}/sendMessage"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=20) as resp:
+                await resp.text()
+    except Exception:
+        pass
+
+
+async def _send_admin(text: str, reply_markup: Optional[dict] = None) -> None:
+    await _send_telegram_message(bot.ADMIN_LOG_CHAT_ID, text, reply_markup=reply_markup)
+
+
+async def _read_text_from_request(request: web.Request) -> str:
+    # GET: /sms?token=...&text=...
+    if request.method == "GET":
+        return request.query.get("text", "") or request.query.get("sms", "") or request.query.get("message", "")
+
+    ctype = (request.headers.get("Content-Type") or "").lower()
+    if "application/json" in ctype:
+        data = await request.json()
+        if isinstance(data, dict):
+            return str(data.get("text") or data.get("sms") or data.get("message") or data.get("body") or "")
+        return str(data)
+    if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
+        data = await request.post()
+        return str(data.get("text") or data.get("sms") or data.get("message") or data.get("body") or "")
+    raw = await request.text()
+    return raw.strip()
+
+
+async def sms_handler(request: web.Request) -> web.Response:
+    if not _auth_ok(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    sms_text = (await _read_text_from_request(request)).strip()
+    if not sms_text:
+        return web.json_response({"ok": False, "error": "empty_sms"}, status=400)
+
+    parsed = bot.extract_madar_transfer_sms(sms_text)
+    phone = parsed.get("phone") or ""
+    amount = parsed.get("amount")
+
+    # Save SMS hash to prevent double activation when MacroDroid repeats request.
+    is_new = await bot.db_record_processed_sms(sms_text, phone, amount, result="received")
+    if not is_new:
+        return web.json_response({"ok": True, "duplicate": True})
+
+    if not phone or amount is None:
+        await _send_admin(
+            "⚠️ وصلت رسالة مدار لكن لم أستطع قراءة الرقم/المبلغ.\n\n"
+            f"النص:\n{sms_text[:1000]}"
+        )
+        return web.json_response({"ok": True, "parsed": False, "needs_review": True})
+
+    match = await bot.db_find_matching_payment_order(phone, float(amount))
+
+    if match.get("status") == "match":
+        order = match["order"]
+        await bot.db_set_user_plan(int(order["user_id"]), order["plan"], int(order["days"]))
+        await bot.db_mark_payment_order_status(int(order["id"]), "auto_approved", matched_sms=sms_text, note="auto approved by Almadar SMS")
+
+        await _send_telegram_message(
+            int(order["user_id"]),
+            "✅ تم تأكيد تحويل المدار تلقائيًا وتفعيل اشتراكك.\n\n"
+            f"الخطة: {order['plan_title']}\n"
+            f"المدة: {order['days']} يوم\n"
+            f"المبلغ: {int(float(order['amount']))} د.ل"
+        )
+        await _send_admin(
+            "✅ تفعيل تلقائي من رسالة المدار\n\n"
+            f"Order: {order['order_code']}\n"
+            f"User ID: {order['user_id']}\n"
+            f"الخطة: {order['plan_title']}\n"
+            f"المبلغ: {int(float(order['amount']))} د.ل\n"
+            f"رقم المحوّل: {order['payer_phone']}"
+        )
+        return web.json_response({"ok": True, "auto_approved": True, "order_id": order["id"]})
+
+    if match.get("status") == "ambiguous":
+        await _send_admin(
+            "⚠️ رسالة مدار مطابقة لأكثر من طلب، تحتاج مراجعة.\n\n"
+            f"الرقم: {phone}\nالمبلغ: {amount}\n\nالنص:\n{sms_text[:1000]}"
+        )
+        return web.json_response({"ok": True, "ambiguous": True})
+
+    # No exact pending order: send to admin, no automatic rejection.
+    await _send_admin(
+        "⚠️ رسالة مدار بدون طلب دفع مطابق.\n\n"
+        f"الرقم المقروء: {phone}\n"
+        f"المبلغ المقروء: {amount} د.ل\n\n"
+        f"النص:\n{sms_text[:1000]}"
+    )
+    return web.json_response({"ok": True, "matched": False, "phone": phone, "amount": amount})
+
+
+async def health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "service": "almadar_sms_webhook"})
+
+
+def main() -> None:
+    bot.init_db()
+    if TOKEN == "CHANGE_ME_SMS_TOKEN":
+        print("WARNING: SMS_WEBHOOK_TOKEN is still default. Set it in .env before public use.", file=sys.stderr)
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/sms", sms_handler)
+    app.router.add_post("/sms", sms_handler)
+    print(f"Starting SMS webhook on http://{HOST}:{PORT}/sms")
+    web.run_app(app, host=HOST, port=PORT)
+
+
+if __name__ == "__main__":
+    main()
