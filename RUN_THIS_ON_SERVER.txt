@@ -1,0 +1,15 @@
+انسخ الأمر التالي كاملًا وشغّله من داخل مجلد المشروع على السيرفر بعد رفع الملفات إلى GitHub:
+
+bash -lc 'set -e; cd ~/medical_bot 2>/dev/null || cd /workspace/medical_bot 2>/dev/null || pwd; git fetch --all; git reset --hard origin/main; python3 -m pip install --upgrade pip; python3 -m pip install -r requirements.txt; mkdir -p data; python3 -m py_compile bot.py worker.py queue_jobs.py sms_webhook.py payment_watchdog.py payment_safety_test.py; python3 payment_safety_test.py; pkill -f "bot.py" 2>/dev/null || true; pkill -f "worker.py" 2>/dev/null || true; pkill -f "sms_webhook.py" 2>/dev/null || true; pkill -f "payment_watchdog.py" 2>/dev/null || true; fuser -k 8088/tcp 2>/dev/null || true; nohup python3 bot.py > nohup.out 2>&1 & nohup python3 worker.py > worker.log 2>&1 & nohup python3 sms_webhook.py > sms_webhook.log 2>&1 & nohup python3 payment_watchdog.py > payment_watchdog.log 2>&1 & sleep 3; echo "=== nohup.out ==="; tail -80 nohup.out || true; echo "=== worker.log ==="; tail -80 worker.log || true; echo "=== sms_webhook.log ==="; tail -80 sms_webhook.log || true; echo "=== payment_watchdog.log ==="; tail -80 payment_watchdog.log || true'
+
+ملفات اللوق:
+- nohup.out
+- worker.log
+- sms_webhook.log
+- payment_watchdog.log
+
+MacroDroid SMS:
+http://SERVER_IP:8088/sms?token=MadarPay2026&sender={sms_number}&text={sms_message}
+
+MacroDroid heartbeat:
+http://SERVER_IP:8088/heartbeat?token=MadarPay2026&device=madar_phone&sender=Almadar
